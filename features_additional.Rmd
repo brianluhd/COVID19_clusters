@@ -1,0 +1,353 @@
+---
+title: "features_additional"
+author: "Brian Lu"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+    df_print: paged
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Overview
+Although diabetes is broadly classified as type 1 and type 2 diabetes, type 2 diabetes is known to be heterogeneous. Finer classifications of diabetes could aid in the personalization of diabetes treatment. [Ahlqvist et al.](https://doi.org/10.1016/s2213-8587(18)30051-2) recently identified 5 subtypes of diabetes with different risks of diabetic complications using glutamate decarboxylase antibody status, age at diagnoses, body mass index, HbA1c, and homeostatic model assessment 2 estimates of beta-cell function and insulin resistance. 
+
+**Objective:** Extract and clean additional records from the UAB Health Systems to feed into clustering algorithms downstream.
+
+# Environment set up
+```{r}
+library(RSQLite)
+library(tidyverse)
+```
+
+# Feature extraction
+Diabetes records from 2020 to 2024 were downloaded from the University of Alabama at Birmingham's (UAB) Health System by Andrew Crouse onto Microsoft Teams. The records were uploaded to Cheaha and imported into the `crouse_2024-06-17.db` SQL database using SQLite. 
+
+The required records were retrieved from `crouse_2024-06-17.db` as separate tibbles. 
+
+```{r}
+# connect to SQL database
+database_path <- "/data/user/brianlu/projects/precision_diabetes/SQL_database/crouse_2024-06-17.db"
+conn <- dbConnect(RSQLite::SQLite(), database_path)
+```
+
+Patient race and gender were retrieved from the `patient_demographics` table. 
+
+```{r}
+## patient demographics
+patient <- dbGetQuery(conn, "SELECT DE_ID, RACE, GENDER, DECEASED, DECEASED_DATE FROM patient_demographics") %>% as_tibble()
+```
+
+HDL, cholesterol, triglyceride, LDL, AST, ALT, GFR, creatinine, urine creatinine, albumin, urine albumin, and urine ketone results were retrieved from the `lab_orders` tables.
+
+```{r}
+# lab tests are split into separate tables by year
+# loop through year for each test
+lab <- list()
+years <- seq(2020, 2024)
+
+where <- c("LOINC = '2085-9'", # HDL
+           "LOINC = '2093-3'", # total cholesterol
+           "LOINC = '2571-8'", # triglyceride
+           "LOINC = '2089-1'", # LDL
+           "LOINC = '1920-8'", # AST
+           "LOINC = '1742-6' or 
+                LOINC = '1744-2'", # ALT
+           "LOINC = '33914-3'", # GFR calc
+           "LOINC = '2160-0'", # creatinine in serum/plasma
+           "LOINC = '2161-8'", # creatinine in urine
+           "LOINC = '1751-7'", # albumin in serum/plasma
+           "LOINC = '1754-1'", # albumin in urine
+           "LOINC = '50557-8' or
+                LOINC = '5797-6'") # urine ketone
+
+for (w in where){
+  where_list <- list()
+  print(paste("Querying WHERE", str_replace_all(w, " \n               ", "")))
+  for (y in years){
+    print(paste("Retrieving", y, "records"))
+    where_list[[paste0("year_", y)]] <- dbGetQuery(conn, paste0("SELECT DE_ID, 
+                                                                  DE_ID_VISIT_NUMBER, 
+                                                                  LOINC,
+                                                                  EVENT_DATE_TIME,
+                                                                  ORDERABLE, 
+                                                                  TASK,
+                                                                  DISPLAYED_RESULT_VALUE, 
+                                                                  UNITS 
+                                                                FROM lab_orders_", y, 
+                                                                " WHERE ", w)) %>% as_tibble()
+  }                         
+  
+  lab[[w]] <- bind_rows(where_list)
+
+}
+
+lab_names = c("hdl", "cholesterol", "tg", "ldl", "ast", "alt", "gfr", "creatinine", "u_creatinine", "albumin", "u_albumin", "u_ketone")
+names(lab) <- lab_names
+```
+
+Close SQL connection.
+
+```{r}
+dbDisconnect(conn)
+```
+
+# Data cleaning
+Source the cleaning functions `clean_lab` and `keep_first`.
+
+`clean_lab` cleans a dataframe extracted for the precision diabetes project by:
+
+1. converting dates and times to proper format, 
+2. imputing values above detection limit (as denoted by >) to limit + 0.1,
+3. imputing values below detection limit (as denoted by <) to limit - 0.1,
+4. checking if all units are identical,
+5. removing replicate tests by taking the median,
+6. removing negative values
+7. removing duplicate values
+
+`keep_first` finds and returns the first lab test of the day for each patients and discards the rest.
+
+```{r}
+source("/data/user/brianlu/projects/precision_diabetes/Clustering/functions_feature_cleaning.R")
+```
+
+## Patient demographics
+
+```{r}
+# clean patient
+patient_cleaned <- patient %>%
+  distinct(DE_ID, .keep_all = T) %>%
+  drop_na()
+
+patient_cleaned$RACE <- ifelse(patient_cleaned$RACE == "", "Unknown", patient_cleaned$RACE)
+patient_cleaned$DECEASED <- ifelse(patient_cleaned$DECEASED == "", 0, 1)
+
+patient_demo <- patient_cleaned %>% mutate(deceased_date = date(mdy_hms(DECEASED_DATE)))
+
+```
+
+
+## HDL
+
+```{r}
+hdl <- clean_lab(lab[["hdl"]], "hdl")
+hdl_cleaned <- keep_first(hdl)
+```
+
+## Total cholesterol
+
+```{r}
+cholesterol <- clean_lab(lab[["cholesterol"]], "cholesterol")
+cholesterol_cleaned <- keep_first(cholesterol)
+```
+
+## Non-HDL cholesterol
+Non-HDL cholesterol was calculated by subtracting HDL cholesterol from total cholesterol.
+
+```{r}
+non_hdl <- inner_join(cholesterol, hdl, 
+                            by = c("DE_ID" = "DE_ID", 
+                                   "cholesterol_visit_number" = "hdl_visit_number", 
+                                   "cholesterol_date_time" = "hdl_date_time"))  %>% # match hdl to total cholesterol
+  mutate(non_hdl = cholesterol - hdl) %>% # calculate non-hdl cholesterol
+  rename(non_hdl_visit_number = cholesterol_visit_number,
+         non_hdl_date_time = cholesterol_date_time,
+         non_hdl_units = cholesterol_units) %>% # rename columns
+  relocate(non_hdl, .after = non_hdl_date_time) %>% #re-order columns
+  select(-c(cholesterol, hdl, hdl_units)) # remove extra columns
+
+non_hdl_cleaned <- keep_first(non_hdl)
+
+```
+
+
+## Triglyceride
+
+```{r}
+tg <- clean_lab(lab[["tg"]], "tg")
+tg_cleaned <- keep_first(tg)
+
+```
+
+## LDL
+
+```{r}
+ldl <- clean_lab(lab[["ldl"]], "ldl")
+
+ldl_cleaned <- keep_first(ldl)
+```
+
+## AST
+
+```{r}
+ast <- clean_lab(lab[["ast"]], "ast")
+ast_cleaned <- keep_first(ast)
+
+```
+
+## ALT
+The 2 units found in the results, "Units/L" and "unit(s)/liter", should be identical. ALT units were standardized to "Units/L".
+
+```{r}
+
+alt <- lab[["alt"]] %>% 
+  mutate(UNITS = "Units/L")
+alt <- clean_lab(alt, "alt")
+
+alt_cleaned <- keep_first(alt)
+
+```
+
+## GFR
+Five records with no GFR units were removed. About half of GFR units listed as "mL/min/1.73m\xb2" instead of "mL/min/1.73 m2" changed to "mL/min/1.73 m2".
+
+```{r}
+# correct units
+gfr <- lab[["gfr"]] %>%
+  filter(UNITS != "") %>%
+  mutate(UNITS = "mL/min/1.73 m2")
+
+gfr <- clean_lab(gfr, "gfr")
+gfr_cleaned <- keep_first(gfr)
+
+```
+
+## Creatinine
+
+```{r}
+creatinine <- clean_lab(lab[["creatinine"]], "creatinine")
+
+creatinine_cleaned <- keep_first(creatinine)
+
+```
+
+## Urine creatinine
+Entries with no units were removed.
+
+```{r}
+u_creatinine <- clean_lab(lab[["u_creatinine"]], "u_creatinine") %>% 
+  filter(u_creatinine_units == "mg/dL")
+
+u_creatinine_cleaned <- keep_first(u_creatinine)
+
+```
+
+## Albumin
+Three units were listed for albumin:
+
+1. g/dL-Historical: renamed as g/dL
+2. gm/dL: looked to be the same as g/dL-Historical but spelled differently. Renamed as g/dL
+3. mg/dL: converted to and renamed as g/dL
+
+Entries with no units were removed.
+
+```{r}
+albumin <- clean_lab(lab[["albumin"]], "albumin") %>% 
+  filter(albumin_units != "")
+
+# standardize units
+albumin$albumin <- ifelse(albumin$albumin_units == "mg/dL", albumin$albumin/1000, albumin$albumin)
+albumin$albumin_units <- "g/dL"
+
+albumin_cleaned <- keep_first(albumin)
+
+```
+
+## Urine albumin
+Removed records without units.
+
+```{r}
+u_albumin <- clean_lab(lab[["u_albumin"]], "u_albumin") %>%
+  filter(u_albumin_units != "")
+u_albumin_cleaned <- keep_first(u_albumin)
+
+```
+
+## Urine ketone
+Urine ketone results were stored as text. Six possible values were usable:
+
+1. Negative
+2. Trace
+3. 1+
+4. 2+
+5. 3+
+6. 4+
+
+All other values were discarded.
+
+```{r}
+u_ketone <- lab[["u_ketone"]]
+
+u_ketone_values <- c("Negative", "Trace", "1+", "2+", "3+", "4+")
+
+name <- "u_ketone"
+
+u_ketone <- u_ketone %>% 
+  mutate(date = date(mdy_hms(EVENT_DATE_TIME)), 
+         date_time = mdy_hms(EVENT_DATE_TIME)) %>%
+  filter(.$DISPLAYED_RESULT_VALUE %in% u_ketone_values) %>% 
+  group_by(DE_ID, DE_ID_VISIT_NUMBER, date_time, UNITS) %>%
+  distinct() %>%
+  rename("{name}" := DISPLAYED_RESULT_VALUE,
+         "{name}_date_time" := date_time,
+         "{name}_units" := UNITS,
+         "{name}_visit_number" := DE_ID_VISIT_NUMBER) %>%
+  ungroup() %>%
+  select("DE_ID", "u_ketone_visit_number", "u_ketone", "u_ketone_date_time")
+
+u_ketone_cleaned <- keep_first(u_ketone)
+```
+
+Also found the first urine ketone test with a positive value for each patient.
+
+```{r}
+u_ketone_pos_values <- c("1+", "2+", "3+", "4+")
+
+u_ketone_first_pos <- u_ketone %>%
+  filter(u_ketone %in% u_ketone_pos_values) %>%
+  group_by(DE_ID) %>%
+  arrange(u_ketone_date_time, .by_group = T) %>%
+  distinct(DE_ID, .keep_all = T)
+
+```
+
+# Export results
+Cleaned lab results were exported as CSV files.
+
+```{r}
+# create export directory if doesn't exist
+export_dir <- "/data/user/brianlu/projects/precision_diabetes/COVID19_clusters/exports"
+export_dir <- file.path(export_dir, paste0("features_additional_", Sys.Date()))
+if (!dir.exists(export_dir)) {
+  dir.create(export_dir, recursive = T)
+}
+
+# export
+write_csv(patient_demo, file.path(export_dir, "patient_demo.csv"))
+write_csv(hdl_cleaned, file.path(export_dir, "hdl.csv"))
+write_csv(cholesterol_cleaned, file.path(export_dir, "cholesterol.csv"))
+write_csv(non_hdl_cleaned, file.path(export_dir, "non_hdl.csv"))
+write_csv(tg_cleaned, file.path(export_dir, "triglyceride.csv"))
+write_csv(ldl_cleaned, file.path(export_dir, "ldl.csv"))
+write_csv(ast_cleaned, file.path(export_dir, "ast.csv"))
+write_csv(alt_cleaned, file.path(export_dir, "alt.csv"))
+write_csv(gfr_cleaned, file.path(export_dir, "gfr.csv"))
+write_csv(creatinine_cleaned, file.path(export_dir, "creatinine.csv"))
+write_csv(u_creatinine_cleaned, file.path(export_dir, "u_creatinine.csv"))
+write_csv(albumin_cleaned, file.path(export_dir, "albumin.csv"))
+write_csv(u_albumin_cleaned, file.path(export_dir, "u_albumin.csv"))
+write_csv(u_ketone_cleaned, file.path(export_dir, "u_ketone.csv"))
+write_csv(u_ketone_first_pos, file.path(export_dir, "u_ketone_first_positive.csv"))
+```
+
+# Session information
+
+```{r}
+sessionInfo()
+```
+

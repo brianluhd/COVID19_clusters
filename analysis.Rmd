@@ -1,0 +1,2224 @@
+---
+title: "manuscript_Ahlqvist_analysis"
+author: "Brian Lu"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+    df_print: paged
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Overview
+Although diabetes is broadly classified as type 1 and type 2 diabetes, type 2 diabetes is known to be heterogeneous. Finer classifications of diabetes could aid in the personalization of diabetes treatment. [Ahlqvist et al.](https://doi.org/10.1016/s2213-8587(18)30051-2) recently identified 5 subtypes of diabetes with different risks of diabetic complications using glutamate decarboxylase antibody status, age at diagnoses, body mass index, HbA1c, and homeostatic model assessment 2 estimates of beta-cell function and insulin resistance. 
+
+**Objective:** Conduct statistical analysis and generate data to construct figures in `manuscript_Ahlqvist_figures.ipynb`.
+
+# Environment set up
+
+```{r}
+library(RSQLite)
+library(tidyverse)
+library(car)
+library(lme4)
+library(lmerTest)
+library(openxlsx)
+```
+
+```{r}
+import_dir <- "/data/user/brianlu/projects/precision_diabetes/COVID19_clusters/exports"
+post_covid_path <- file.path(import_dir, "remap_clusters_rf_2024-07-19/remapped_outpatient.csv")
+
+post_covid <- read_csv(post_covid_path)
+```
+
+# Feature engineering
+
+## Clean up post-COVID19 data to match pre-COVID19 data
+Add units.
+
+```{r}
+post_covid <- post_covid %>%
+  mutate(homa_cpeptide_b_units = "%",
+         homa_cpeptide_s_units = "%",
+         homa_cpeptide_ir_units = "Index",
+         homa_insulin_b_units = "%",
+         homa_insulin_s_units = "%",
+         homa_insulin_ir_units = "Index",
+         diabetes_age_units = "Years",
+         bmi_units = "kg/m^2")
+```
+
+Recode gender from just first letter abbreviations to full name.
+
+```{r}
+post_covid <- post_covid %>%
+  rename(gender = GENDER) %>%
+  mutate(gender = case_match(gender,
+                             "M" ~ "Male",
+                             "F" ~ "Female"))
+```
+
+Recode first positive urine ketone from string to postive or negative.
+
+```{r}
+post_covid$u_ketone_first_positive <- ifelse(is.na(post_covid$u_ketone_first_positive), 0, 1)
+```
+
+Rename DECEASED to deceased.
+
+```{r}
+post_covid <- post_covid %>% rename(deceased = DECEASED)
+```
+
+There were too few patients who are not White or Black or African American for meaningful analysis. Combine races other than White or Black/African American into Other.
+
+```{r}
+post_covid <- post_covid %>% 
+  rename(race_original = RACE) %>% 
+  mutate(race = ifelse(race_original == "White" | race_original == "Black or African American", race_original, "Other"))
+```
+
+Calculate triglyceride/hdl and ldl/hdl ratios.
+
+```{r}
+post_covid <- post_covid %>% mutate(triglyceride_hdl = ifelse(.$triglyceride_date == .$hdl_date, .$triglyceride/.$hdl, NA),
+                                      triglyceride_hdl_units = "Ratio",
+                                      ldl_hdl = ifelse(.$ldl_date == .$hdl_date, .$ldl/.$hdl, NA),
+                                      ldl_hdl_units = "Ratio")
+
+```
+
+Classify BMI.
+
+```{r}
+post_covid$bmi_class <- ifelse(post_covid$race_original == "Asian" & post_covid$bmi < 18.5, "underweight",
+                    ifelse(post_covid$race_original == "Asian" & post_covid$bmi >= 18.5 & post_covid$bmi < 23, "normal",
+                           ifelse(post_covid$race_original == "Asian" & post_covid$bmi >= 23 & post_covid$bmi < 27.5, "overweight",
+                                  ifelse(post_covid$race_original == "Asian" & post_covid$bmi >= 27.5, "obese",
+                                         
+                                         ifelse(post_covid$race_original != "Asian" & post_covid$bmi <= 18.5, "underweight",
+                                                ifelse(post_covid$race_original != "Asian" & post_covid$bmi >= 18.5 & post_covid$bmi < 25, "normal",
+                                                       ifelse(post_covid$race_original != "Asian" & post_covid$bmi >= 25 & post_covid$bmi < 30, "overweight",
+                                                              ifelse(post_covid$race_original != "Asian" & post_covid$bmi >= 30, "obese", NA))))))))
+
+```
+
+Label each Ahlqvist cluster for leave-one-out comparisons.
+
+```{r}
+order <- c("SAID", "SIDD", "SIRD", "MOD", "MARD")
+
+for (c in order){
+    post_covid[[c]] = ifelse(post_covid$mapped_cluster == c, 1, 0)
+}
+```
+
+Calculate deceased age.
+
+```{r}
+post_covid <- post_covid %>%
+  mutate(deceased_age = as.numeric(deceased_date - birth_date, "days")/365,
+         deceased_age_units = "Years")
+```
+
+Rename cluster.
+
+```{r}
+post_covid <- post_covid %>% rename(cluster = mapped_cluster) 
+
+```
+
+Label post-COVID19 and insert censor date.
+
+```{r}
+# find censor date
+database_path <- "/data/user/brianlu/projects/precision_diabetes/SQL_database/crouse_2024-06-17.db"
+conn <- dbConnect(RSQLite::SQLite(), database_path)
+
+covid_censored_date <- dbGetQuery(conn, "SELECT DISTINCT DIAG_DT_TM FROM diagnoses") %>%
+  as_tibble() %>%
+  mutate(date = date(mdy_hms(DIAG_DT_TM))) %>%
+  pull(date) %>%
+  max()
+
+dbDisconnect(conn)
+
+# insert label and date
+post_covid <- post_covid %>%
+  mutate(pandemic = "post",
+         covid19_censored_date = case_when(!is.na(covid19_date) ~ covid19_date,
+                                           .default = ymd(covid_censored_date)))
+
+
+
+```
+
+Find deceased censoring date for pre-COVID data. Last diagnosis date is 2020-01-01, but deceased date extends past 2020-01-01, probably to when data was pulled. The last deceased date for post-COVID data is prior to the last diagnosis date.
+
+```{r}
+database_path <- "/data/user/brianlu/projects/precision_diabetes/SQL_database/crouse_2023-06-26.db"
+conn <- dbConnect(RSQLite::SQLite(), database_path)
+
+deceased_censor_date <- dbGetQuery(conn, "SELECT DISTINCT DECEASED_DATE FROM patient_demographics") %>%
+    as_tibble() %>%
+    mutate(date = date(mdy_hms(DECEASED_DATE))) %>%
+    pull(date) %>%
+    max(na.rm = T)
+
+dbDisconnect(conn)
+```
+
+Retrieve insulin prescription data.
+
+```{r}
+# connect to SQL database
+database_path <- "/data/user/brianlu/projects/precision_diabetes/SQL_database/crouse_2024-06-17.db"
+conn <- dbConnect(RSQLite::SQLite(), database_path)
+
+# get matching MRNS for DE_ID in SIDD White and AA patients
+mrn <- dbGetQuery(conn, "SELECT MRN, DE_ID FROM mrns") %>% 
+  as_tibble() %>% 
+  filter(DE_ID %in% post_covid$DE_ID)
+
+# search medication records by MRNS
+years <- c(seq(2020, 2024))
+
+# add single quotes to beginning and end of string
+mrn_list <- str_replace_all(as.character(mrn$MRN), "^(.*)$", "'\\1'")
+
+# declare list to aggregate prescription data
+prescription_list <- list()
+
+prescription_names <- c("insulin", 
+                        #"glucagon", 
+                        "metformin", 
+                        #"sulfonylurea", 
+                        #"SGLT2i"
+                        "GLP1RA"
+                        )
+prescription_search <- c("'%insulin%'", 
+                         #"'%glucagon%'",
+                         "'%metformin%'", 
+                         #"'%glimepiride%' or ORDERABLE LIKE '%glipizide%' or ORDERABLE LIKE '%glyburide%'",
+                         #"'%bexagliflozin%' or ORDERABLE LIKE '%canagliflozin%' or ORDERABLE LIKE '%dapagliflozin%' or ORDERABLE LIKE '%empagliflozin%'"
+                         "'%dulaglutide%' or ORDERABLE LIKE '%albiglutide%' or ORDERABLE LIKE  '%liraglutide%' or ORDERABLE LIKE '%semaglutide%' or ORDERABLE LIKE '%exenatide%' or ORDERABLE LIKE '%lixisenatide%' or ORDERABLE LIKE '%tirzepatide%'"
+                         )
+names(prescription_search) <- prescription_names
+
+for (p in prescription_names){
+  # aggregate prescription data
+  years_list <- list()
+  print(paste("Querying", p))
+  
+  for (y in years){
+    print(paste("Retrieving", y, "records"))
+    
+    table_name <- paste("all_meds", y, sep = "_")
+    years_list[[paste("year", y, sep = "_")]] <- dbGetQuery(conn, paste0("SELECT MRN, ORDER_DT_TM ",
+                                                              "FROM ", table_name, " ",
+                                                              "WHERE (ORDERABLE LIKE ", prescription_search[p], ") and ", 
+                                                              "MRN IN (", paste(mrn_list, collapse = ","), ")")) %>% 
+      as_tibble() %>%
+      mutate(order_date = date(mdy_hms(ORDER_DT_TM))) %>% 
+      filter(order_date >= "2020-01-01") %>%
+      distinct(MRN, .keep_all = T)
+  
+  }
+  # merge list into single tibble
+  prescription_list[[p]] <- bind_rows(years_list)
+  
+  # match to DE_ID
+  prescription_list[[p]] <- mrn %>% 
+    left_join(prescription_list[[p]], by = c("MRN" = "MRN")) %>% 
+    select(-MRN, -ORDER_DT_TM) %>% # remove identifying MRNS
+    rename("{p}_prescription_date" := order_date) %>% 
+    group_by(DE_ID) %>% 
+    arrange(get(paste0(p, "_prescription_date")), .by_group = T) %>% # arrange to find first prescription
+    distinct(DE_ID, .keep_all = T) %>% # only keep first prescription
+    mutate("{p}_prescription" := ifelse(is.na(.data[[paste0(p, "_prescription_date")]]), 0, 1)) %>% # 0 if no prescription
+    mutate("{p}_prescription_date" := case_when(get(paste(p, "prescription", sep = "_")) == 0 ~ ymd(covid_censored_date), 
+                                                .default = get(paste0(p, "_prescription_date")))) # insert censor date
+
+}
+
+# disconnect connection to SQL
+dbDisconnect(conn)
+
+# merge into 1 tibble
+prescription <- prescription_list[["insulin"]]
+for (p in prescription_names[prescription_names != "insulin"]){
+  prescription <- prescription %>% full_join(prescription_list[[p]], by = join_by(DE_ID))
+}
+
+# match DE_ID type before joining
+prescription <- prescription %>% mutate(DE_ID = as.numeric(DE_ID))
+
+post_covid <- post_covid %>% left_join(prescription, by = join_by(DE_ID))
+
+```
+
+## Import pre-COVID19 data
+
+```{r}
+pre_covid_path <- file.path("/data/user/brianlu/projects/precision_diabetes/Clustering/exports", 
+                            "manuscript_Ahlqvist_analysis_2024-05-03/outpatient.csv")
+
+pre_covid <- read_csv(pre_covid_path)
+
+pre_covid <- pre_covid %>% mutate(cluster = Ahlqvist,
+                                  covid19 = 0,
+                                  covid19_date = NA,
+                                  covid19_censored_date = mdy("12-31-2019"),
+                                  pandemic = "pre")
+```
+
+## Find hospitalization records
+
+### Pre-COVID inpatient data
+
+```{r}
+# connect to SQL database
+database_path <- "/data/user/brianlu/projects/precision_diabetes/SQL_database/crouse_2023-06-26.db"
+conn <- dbConnect(RSQLite::SQLite(), database_path)
+
+# extract DE_ID to query
+precovid_id <- str_replace_all(as.character(pre_covid$DE_ID), "^(.*)$", "'\\1'")
+
+# retrieve inpatient encounters
+pre_covid_inpatient <- dbGetQuery(conn, paste0("SELECT DE_ID, ENCOUNTER_DATE
+                                                FROM encounters 
+                                                WHERE ENCOUNTER_TYPE_CLASS = 'Inpatient' AND
+                                                DE_ID IN (", 
+                                                paste(precovid_id, collapse = ","), 
+                                                ")")) %>% 
+  as_tibble() %>%
+  # fix formatting
+  mutate(DE_ID = as.numeric(DE_ID),
+         inpatient_date = date(mdy_hms(ENCOUNTER_DATE))) %>%
+  # join to get diabetes dates
+  left_join(x = ., y = pre_covid %>% select(DE_ID, diabetes_date), by = join_by(DE_ID)) %>%
+  # keep only inpatient encounters after diabetes diagnosis
+  filter(inpatient_date >= diabetes_date) %>%
+  # calculate time to inpatient encounter
+  mutate(to_inpatient = as.numeric(inpatient_date - diabetes_date, "days")/365)
+
+# count inpatient encounters per patient
+pre_covid_inpatient_counts <- pre_covid_inpatient %>%
+  group_by(DE_ID) %>%
+  summarise(inpatient_visit_count = n(),
+            to_inpatient = min(to_inpatient))
+
+# join with rest of data
+pre_covid <- pre_covid %>%
+  left_join(pre_covid_inpatient_counts, by = join_by(DE_ID)) %>%
+  # fix missing fields for patient without inpatient encounters
+  mutate(inpatient_visit_count = case_when(is.na(inpatient_visit_count) ~ 0,
+                                           .default = inpatient_visit_count),
+         inpatient = case_when(inpatient_visit_count > 0 ~ 1,
+                               .default = 0),
+         to_inpatient = case_when(is.na(to_inpatient) ~ as.numeric(mdy("12-31-2019") - diabetes_date, "days")/365,
+                                  .default = to_inpatient)
+  )
+
+```
+
+### Post-COVID inpatient data
+
+```{r}
+# connect to SQL database
+database_path <- "/data/user/brianlu/projects/precision_diabetes/SQL_database/crouse_2024-06-17.db"
+conn <- dbConnect(RSQLite::SQLite(), database_path)
+
+# extract DE_ID to query
+postcovid_id <- str_replace_all(as.character(post_covid$DE_ID), "^(.*)$", "'\\1'")
+
+# retrieve inpatient encounters
+post_covid_inpatient <- dbGetQuery(conn, paste0("SELECT DE_ID, ENCOUNTER_DATE
+                                                FROM encounters 
+                                                WHERE ENCOUNTER_TYPE_CLASS = 'Inpatient' AND
+                                                DE_ID IN (", 
+                                                paste(postcovid_id, collapse = ","), 
+                                                ")")) %>% 
+  as_tibble() %>%
+  # fix formatting
+  mutate(DE_ID = as.numeric(DE_ID),
+         inpatient_date = date(mdy_hms(ENCOUNTER_DATE))) %>%
+  # join to get diabetes dates
+  left_join(x = ., y = post_covid %>% select(DE_ID, diabetes_date), by = join_by(DE_ID)) %>%
+  # keep only inpatient encounters after diabetes diagnosis
+  filter(inpatient_date >= diabetes_date) %>%
+  # calculate time to inpatient encounter
+  mutate(to_inpatient = as.numeric(inpatient_date - diabetes_date, "days")/365)
+
+# count inpatient encounters per patient
+post_covid_inpatient_counts <- post_covid_inpatient %>%
+  group_by(DE_ID) %>%
+  summarise(inpatient_visit_count = n(),
+            to_inpatient = min(to_inpatient))
+
+# join with rest of data
+post_covid <- post_covid %>%
+  left_join(post_covid_inpatient_counts, by = join_by(DE_ID)) %>%
+  # fix missing fields for patient without inpatient encounters
+  mutate(inpatient_visit_count = case_when(is.na(inpatient_visit_count) ~ 0,
+                                           .default = inpatient_visit_count),
+         inpatient = case_when(inpatient_visit_count > 0 ~ 1,
+                               .default = 0),
+         to_inpatient = case_when(is.na(to_inpatient) ~ 
+                                    as.numeric(ymd(covid_censored_date) - diabetes_date, "days")/365,
+                                  .default = to_inpatient)
+  )
+
+dbDisconnect(conn)
+```
+
+
+## Find prescription data
+
+```{r}
+# connect to SQL database
+database_path <- "/data/user/brianlu/projects/precision_diabetes/SQL_database/crouse_2024-01-10.db"
+conn <- dbConnect(RSQLite::SQLite(), database_path)
+
+# get matching MRNS for DE_ID in SIDD White and AA patients
+mrn <- dbGetQuery(conn, "SELECT MRNS, DE_ID FROM mrns") %>% 
+  as_tibble() %>% 
+  filter(DE_ID %in% pre_covid$DE_ID)
+
+# search medication records by MRNS
+years <- c("pre2013", seq(2013, 2019))
+
+# add single quotes to beginning and end of string
+mrn_list <- str_replace_all(as.character(mrn$MRNS), "^(.*)$", "'\\1'")
+
+# declare list to aggregate prescription data
+prescription_list <- list()
+
+
+for (p in prescription_names){
+  # aggregate prescription data
+  years_list <- list()
+  print(paste("Querying", p))
+  
+  for (y in years){
+    print(paste("Retrieving", y, "records"))
+    
+    table_name <- paste("all_meds", y, sep = "_")
+    years_list[[paste("year", y, sep = "_")]] <- dbGetQuery(conn, paste0("SELECT MRN, ORDER_DT_TM ",
+                                                              "FROM ", table_name, " ",
+                                                              "WHERE (ORDERABLE LIKE ", prescription_search[p], ") and ", 
+                                                              "MRN IN (", paste(mrn_list, collapse = ","), ")")) %>% 
+      as_tibble() %>%
+      mutate(order_date = date(mdy_hms(ORDER_DT_TM))) %>% 
+      filter(order_date >= "2010-01-01" & order_date <= "2019-12-31") %>%
+      distinct(MRN, .keep_all = T)
+  
+  }
+  # merge list into single tibble
+  prescription_list[[p]] <- bind_rows(years_list)
+  
+  # match to DE_ID
+  prescription_list[[p]] <- mrn %>% 
+    left_join(prescription_list[[p]], by = c("MRNS" = "MRN")) %>% 
+    select(-MRNS, -ORDER_DT_TM) %>% # remove identifying MRNS
+    rename("{p}_prescription_date" := order_date) %>% 
+    group_by(DE_ID) %>% 
+    arrange(get(paste0(p, "_prescription_date")), .by_group = T) %>% # arrange to find first prescription
+    distinct(DE_ID, .keep_all = T) %>% # only keep first prescription
+    mutate("{p}_prescription" := ifelse(is.na(.data[[paste0(p, "_prescription_date")]]), 0, 1)) %>% # 0 if no prescription
+    mutate("{p}_prescription_date" := case_when(get(paste(p, "prescription", sep = "_")) == 0 ~ ymd("2019-12-31"), 
+                                                .default = get(paste0(p, "_prescription_date")))) # insert censor date
+
+}
+
+# disconnect connection to SQL
+dbDisconnect(conn)
+
+# merge into 1 tibble
+prescription <- prescription_list[["insulin"]]
+for (p in prescription_names[prescription_names != "insulin"]){
+  prescription <- prescription %>% full_join(prescription_list[[p]], by = join_by(DE_ID))
+}
+
+# match DE_ID type before joining
+prescription <- prescription %>% mutate(DE_ID = as.numeric(DE_ID))
+
+pre_covid <- pre_covid %>% 
+  select(-insulin_order_date, -insulin_prescription) %>% # remove insulin from previous analysis
+  left_join(prescription, by = join_by(DE_ID))
+
+```
+
+## Join data
+Combine pre- and post-COVID19 data.
+
+```{r}
+join_feature <- colnames(post_covid)[(colnames(post_covid) %in% colnames(pre_covid))]
+
+pre_covid_selected <- pre_covid %>% select(all_of(join_feature))
+  
+post_covid_selected <- post_covid %>% select(all_of(join_feature))
+
+joined_data <- rbind(pre_covid_selected, post_covid_selected) %>% 
+  mutate(covid19_date = as_date(covid19_date),
+         date_range = factor(case_when(diabetes_date < "2015-01-01" ~ "y2010",
+                                       diabetes_date >= "2015-01-01" & diabetes_date < "2020-01-01" ~ "y2015",
+                                       diabetes_date >= "2020-01-01" ~ "y2020"),
+                             levels = c("y2010", "y2015", "y2020")),
+         date_range_2020 = relevel(date_range, ref = "y2020"))
+```
+
+# Calculate complicate dates
+
+```{r}
+complication_names <- c("mi", "stroke", "neuropathy", "esrd", "nephropathy", "retinopathy", "nafld", "dka", "u_ketone_first_positive")
+for (c in complication_names){
+  diagnosis_date <- paste(c, "date", sep = "_")
+  joined_data <- joined_data %>%
+    mutate("to_{c}" := case_when(!is.na(.[[diagnosis_date]]) ~ as.numeric(.[[diagnosis_date]] - diabetes_date, "days")/365,
+                                 is.na(.[[diagnosis_date]]) & pandemic == "pre" ~ 
+                                   as.numeric(mdy("12-31-2019") - diabetes_date, "days")/365,
+                                 is.na(.[[diagnosis_date]]) & pandemic == "post" ~ 
+                                   as.numeric(ymd(covid_censored_date) - diabetes_date, "days")/365,
+                                 .default = NA) 
+          )
+}
+
+joined_data <- joined_data %>% 
+  mutate(to_deceased = case_when(!is.na(deceased_date) ~ as.numeric(deceased_date - diabetes_date, "days")/365,
+                                 is.na(deceased_date) & pandemic == "pre" ~ 
+                                   as.numeric(ymd(deceased_censor_date) - diabetes_date, "days")/365,
+                                 is.na(deceased_date) & pandemic == "post" ~ 
+                                   as.numeric(ymd(covid_censored_date) - diabetes_date, "days")/365,
+                                 .default = NA))
+```
+
+
+# People with multiple HOMA measurements
+
+```{r}
+homa_path <- "/data/user/brianlu/projects/precision_diabetes/COVID19_clusters/exports/features_Ahlqvist_2024-06-28/homa_cpeptide_calc.csv"
+homa <- read_csv(homa_path) %>% mutate(homa_cpeptide_date = mdy(homa_cpeptide_date))
+
+covid_homa <- post_covid %>% 
+  filter(covid19 == 1) %>% 
+  select(DE_ID, covid19, covid19_date) %>% left_join(homa, by = join_by(DE_ID))
+
+multiple_homa_tests <- covid_homa %>% group_by(DE_ID) %>% summarise(n = n()) %>% filter(n > 1) %>% pull(DE_ID)
+
+covid_homa <- covid_homa %>% 
+  filter(DE_ID %in% multiple_homa_tests) %>% 
+  mutate(before_covid = case_when(homa_cpeptide_date <= covid19_date ~ "before",
+                                  .default = "after"),
+         to_covid19 = as.numeric(homa_cpeptide_date - covid19_date, "days")) %>%
+  group_by(DE_ID, before_covid) %>%
+  filter(to_covid19 == min(to_covid19)) # keep value closest to before and after covid
+
+before <- covid_homa %>% group_by(DE_ID) %>%
+  filter(n() > 1 & before_covid == "before")
+after <- covid_homa %>% group_by(DE_ID) %>%
+  filter(n() > 1 & before_covid == "after")  
+  
+t.test(before$homa_cpeptide_ir, after$homa_cpeptide_ir, paired = T)
+```
+
+# Import analysis functions
+
+Source functions to generate summary tables.
+
+```{r}
+# import functions to summarize features into tables
+source("/data/user/brianlu/projects/precision_diabetes/COVID19_clusters/functions_analysis.R")
+```
+
+Select features to summarize.
+
+```{r}
+# declare features
+ahlqvist <- c("gad", "a1c", "bmi", "diabetes_age", "homa_cpeptide_b", "homa_cpeptide_ir")
+demo <- c(# "median_income", 
+          "deceased_age")
+complications <- c("neuropathy", "retinopathy", "nephropathy", "esrd", "nafld", 
+                   "cvd", # cumulative of mi and stroke
+                   "mi", "stroke", 
+                   "dka", "u_ketone_first_positive", "deceased",
+                   "covid19")
+glucose_homeostasis <- c("glucose", "insulin", "cpeptide", "homa_cpeptide_s")
+liver <- c("albumin", "alt", "ast")
+lipid <- c("cholesterol", "hdl", "ldl", "ldl_hdl", "non_hdl", "triglyceride", "triglyceride_hdl")
+kidney <- c("creatinine", "gfr", "u_albumin", "u_creatinine")
+prescription <- c("insulin_prescription")
+
+# declare covariates
+covariates <- c("race", "gender", "diabetes_age")
+
+# declare list to store analysis results
+analysis_list <- c()
+
+# replace feature names from R variable naming conventions style to manuscript style
+feature_rename <- function(df){
+  df <- df %>% 
+    mutate(Features = case_when(
+      Features == "gad" ~ "GAD antibody",
+      Features == "a1c" ~ "HbA1c",
+      Features == "bmi" ~ "BMI",
+      Features == "diabetes_age" ~ "Diagnosis age",
+      Features == "homa_cpeptide_b" ~ "HOMA2-B",
+      Features == "homa_cpeptide_ir" ~ "HOMA2-IR",
+      Features == "gender" ~ "Gender",
+      Features == "race" ~ "Race",
+      Features == "median_income" ~ "Median income",
+      Features == "deceased_age" ~ "Deceased age",
+      Features == "neuropathy" ~ "Neuropathy",
+      Features == "retinopathy" ~ "Retinopathy",
+      Features == "nephropathy" ~ "Nephropathy",
+      Features == "esrd" ~ "End-stage renal disease (ESRD)",
+      Features == "nafld" ~ "MASLD",
+      Features == "cvd" ~ "Cardiovascular disease (CVD)",
+      Features == "mi" ~ "MI",
+      Features == "stroke" ~ "Stroke",
+      Features == "dka" ~ "Diabetic ketoacidosis (DKA)",
+      Features == "u_ketone_first_positive" ~ "Urine ketones",
+      Features == "deceased" ~ "Deceased",
+      Features == "covid19" ~ "COVID19",
+      Features == "glucose" ~ "Glucose",
+      Features == "insulin" ~ "Insulin",
+      Features == "cpeptide" ~ "C-peptide",
+      Features == "homa_cpeptide_s" ~ "HOMA2-S",
+      Features == "albumin" ~ "Albumin",
+      Features == "alt" ~ "ALT",
+      Features == "ast" ~ "AST",
+      Features == "cholesterol" ~ "Cholesterol",
+      Features == "hdl" ~ "HDL",
+      Features == "ldl" ~ "LDL",
+      Features == "ldl_hdl" ~ "LDL/HDL ratio",
+      Features == "non_hdl" ~ "Non-HDL cholesterol",
+      Features == "triglyceride" ~ "Triglycerides",
+      Features == "triglyceride_hdl" ~ "Triglyceride/HDL ratio",
+      Features == "creatinine" ~ "Creatinine",
+      Features == "gfr" ~ "eGFR",
+      Features == "u_albumin" ~ "Urine albumin",
+      Features == "u_creatinine" ~ "Urine creatinine",
+      Features == "insulin_prescription" ~ "Insulin prescription",
+      .default = Features
+    ))
+  
+  return(df)
+}
+```
+
+Set reference levels for logistic regression.
+
+```{r}
+# relevel to set reference levels for regression
+joined_data <- joined_data %>%
+  mutate(race = factor(race, levels = c("White", "Black or African American", "Other")),
+         gender = factor(gender, levels = c("Male", "Female")),
+         pandemic = factor(pandemic, levels = c("pre", "post")),
+         covid19_status = factor(case_when(!is.na(covid19_date) ~ "positive", 
+                                           .default = "negative"), 
+                                 levels = c("negative", "positive")),
+         cluster = factor(cluster, levels = c("SAID", "SIDD", "SIRD", "MOD", "MARD")))
+
+# joined_data$race_factor <- factor(joined_data$race)
+# joined_data$race_factor <- relevel(joined_data$race_factor, ref = "White")
+# 
+# joined_data$gender_factor <- factor(joined_data$gender)
+# joined_data$gender_factor <- relevel(joined_data$gender_factor, ref = "Male")
+```
+
+
+Set up export directory.
+
+```{r}
+# create export directory if doesn't exist
+export_dir <- "/data/user/brianlu/projects/precision_diabetes/COVID19_clusters/exports"
+export_dir <- file.path(export_dir, paste0("analysis_", Sys.Date()))
+if (!dir.exists(export_dir)) {
+  dir.create(export_dir, recursive = T)
+}
+```
+
+
+# Table 1
+Construct table 1 as tibble.
+
+```{r}
+# calculate stats for table
+baseline <- get_feature_summary(df = joined_data, 
+                                features = c("gender", "race", 
+                                             "a1c", "bmi", "diabetes_age", 
+                                             "deceased_age",
+                                             "homa_cpeptide_ir", "glucose", "cpeptide", 
+                                             "cholesterol", "ldl", "hdl", "triglyceride"
+                                             ),
+                                categories = c("pandemic"),
+                                covariates = NA,
+                                distribution_stat = "ci") %>% feature_rename()
+
+# construct patient_char tibble
+patient_char <- tibble(Period = c("N"), 
+                       `2010-2019\n(Pre-pandemic)` = as.character(nrow(pre_covid)),
+                       `2020-2024\n(Post-pandemic)` = as.character(nrow(post_covid)),
+                       P = "")
+
+# construct counts table to join with patient_char
+counts_table <- baseline %>% 
+  filter(grepl("count", Summary)) %>% # filter to count data only
+  mutate(Value = str_replace(Value, "Black or African American", "AA"),
+         Value = factor(Value, levels = c("Male", 
+                                          "Female", 
+                                          "AA", 
+                                          "White", 
+                                          "Other"))) %>%
+  arrange(Value) %>% #rearrange order by factor
+  rename(Period = Value, 
+         `2010-2019\n(Pre-pandemic)` = pre, 
+         `2020-2024\n(Post-pandemic)` = post, 
+         P = `Pandemic p-value`) %>% # rename columns to match
+  filter(Period != "Female") %>% # remove rows
+  filter(Period != "Other") %>% # remove rows
+  select(Period, `2010-2019\n(Pre-pandemic)`, `2020-2024\n(Post-pandemic)`, P) # select joining columns
+
+# constructs continuous table to join with patient_char
+cont_table <- baseline %>% 
+  filter(!grepl("count", Summary)) %>% # filter to continuous data only
+  mutate(Value = str_replace_all(Value, "Index|\\^", ""),
+         Value = str_replace_all(Value, "Years", "years"),
+         Period = case_when(Value != "" ~ paste0(Features, " [", Value, "]"),
+                            .default = paste0(Features, Value))) %>% # attach units to feature
+  rename(`2010-2019\n(Pre-pandemic)` = pre, 
+         `2020-2024\n(Post-pandemic)` = post, 
+         P = `Pandemic p-value`) %>% # rename columns to match
+  select(Period, `2010-2019\n(Pre-pandemic)`, `2020-2024\n(Post-pandemic)`, P) # select joining columns
+
+analysis_list[["patient_char"]] <- bind_rows(patient_char, counts_table, cont_table)
+
+```
+
+Add formatting and export as excel file.
+
+```{r}
+# create workbook
+wb <- createWorkbook()
+
+# add table 1
+addWorksheet(wb, sheetName = "Table 1", gridLines = F)
+writeData(wb, sheet = "Table 1", x = analysis_list[["patient_char"]], borders = "none", 
+          headerStyle = createStyle(textDecoration = "Bold", 
+                                    border = c("top", "bottom"), 
+                                    halign = "center", 
+                                    valign = "center"))
+# bold first column
+addStyle(wb, "Table 1", createStyle(textDecoration = "Bold", 
+                                    halign = "left", 
+                                    valign = "center"), 
+         rows = 2:(nrow(analysis_list[["patient_char"]]) + 1), # skip header row
+         cols = 1, gridExpand = T)
+
+# center align sheet except first and last column
+addStyle(wb, "Table 1", createStyle(textDecoration = NULL, 
+                                     halign = "center", 
+                                     valign = "center"), 
+         rows = 1:nrow(analysis_list[["patient_char"]]) + 1, # skip header row
+         cols = 2:ncol(analysis_list[["patient_char"]]), gridExpand = T) # except first column
+
+# italicize p-value
+addStyle(wb, "Table 1", createStyle(textDecoration = "italic", 
+                                     halign = "center", 
+                                     valign = "center", 
+                                     fontSize = 9), 
+         rows = 2:nrow(analysis_list[["patient_char"]]) + 1, # skip header row
+         cols = ncol(analysis_list[["patient_char"]]), gridExpand = T)
+
+# set column width
+setColWidths(wb, "Table 1", cols = 1:ncol(analysis_list[["patient_char"]]), widths = "auto")
+
+# export
+saveWorkbook(wb, file.path(export_dir, "table_1.xlsx"), overwrite = TRUE)
+
+```
+
+# Figure 1
+
+```{r}
+
+
+cluster_colors = c("cornflowerblue", "powderblue", "darkseagreen", "lightsalmon", "plum")
+dpi = 600
+
+pie <- list()
+
+# function to calculate numbers needed to generate pie chart
+calc_pie <- function(df, group, label_order){
+  percent <- prop.table(table(df[[group]]))
+  pie_stats <- tibble(group = label_order,
+                  percent = as.vector(percent[order(factor(names(percent), levels = label_order))]) * 100) %>%
+    mutate(group = factor(group, levels = label_order)) %>%
+    arrange(desc(group)) %>%
+    mutate(ylabel = sprintf("%.0f", .$percent),
+           ypos = cumsum(percent)- 0.5*percent)
+  
+  return(pie_stats)
+}
+
+
+# calculate numbers needed for pie chart
+for (p in c("pre", "post")){
+  pandemic_subset <- joined_data %>% 
+    filter(pandemic == p) %>% 
+    mutate(race = case_when(race == "Black or African American" ~ "AA", .default = race))
+  
+  pie[[paste(p, "overall", sep = "_")]] <- calc_pie(pandemic_subset, group = "cluster", label_order = order)
+  # subset by gender
+  for (g in c("Male", "Female")){
+    pandemic_subset_gender <- pandemic_subset %>% filter(gender == g)
+    
+    pie[[paste(p, "overall", g, sep = "_")]] <- calc_pie(pandemic_subset_gender, group = "cluster", label_order = order)
+  }
+  # subset by gender
+  for (r in c("White", "AA")){
+    pandemic_subset_race <- pandemic_subset %>% filter(race == r)
+    
+    pie[[paste(p, "overall", r, sep = "_")]] <- calc_pie(pandemic_subset_race, group = "cluster", label_order = order)
+  } 
+  
+  
+  pie[[paste(p, "gender", sep = "_")]] <- calc_pie(pandemic_subset, group = "gender", label_order = c("Male", "Female"))
+  pie[[paste(p, "race", sep = "_")]] <- calc_pie(pandemic_subset, group = "race", label_order = c("White", "AA", "Other"))
+
+}
+
+for (n in names(pie)){
+
+  # generate base pie chart
+  pie_graph <- ggplot(pie[[n]], aes(x = "", y = percent, fill = group)) +
+    geom_bar(stat="identity", width = 1, show.legend = T) +
+    coord_polar("y", start = pi/2)
+
+  # add colors
+  if (nrow(pie[[n]]) == 5){
+    pie_graph <- pie_graph + scale_fill_manual(values = cluster_colors, limits = order)
+  } else if (nrow(pie[[n]]) == 3){
+    pie_graph <- pie_graph + scale_fill_brewer(palette = "Accent")
+  } else if (nrow(pie[[n]]) == 2){
+    pie_graph <- pie_graph + scale_fill_brewer(palette = "Set2")
+  }
+  
+  # add percent labels and theme
+  pie_graph <- pie_graph + geom_text(aes(x = 1.1, y = ypos, label = paste0(ylabel, "%")), color = "black", size = 8*0.5) +
+      labs(fill = "") + 
+      theme_classic() + 
+      theme_void()
+
+  # add legend if post pandemic overall
+  if (n == "post_overall"){
+    pie_graph <- pie_graph + theme(#plot.title = element_text(hjust = 0.5, size = 8),
+      legend.text=element_text(size = 8),
+      legend.justification = "top")
+    
+    # save larger size to accommodate for legend
+    ggsave(file.path(export_dir, paste0("fig1_", n, ".tiff")), plot = pie_graph, width = 6.5, height = 4.5, units = "cm", dpi = dpi)
+
+  } else { # remove legend for all others
+    pie_graph <- pie_graph + theme(legend.position = "none")
+    
+    # save
+    ggsave(file.path(export_dir, paste0("fig1_", n, ".tiff")), plot = pie_graph, width = 4.5, height = 4.5, units = "cm", dpi = dpi)
+  }
+  
+
+  
+}
+
+
+```
+
+## Gender comparision
+
+```{r}
+
+analysis_list[["uni_pre_pandemic_gender"]] <- get_feature_summary(df = joined_data %>% filter(pandemic == "pre"), 
+                                                                  features = "gender", 
+                                                                  categories = "cluster") %>%
+  feature_rename()
+
+
+analysis_list[["uni_post_pandemic_gender"]] <- get_feature_summary(df = joined_data %>% filter(pandemic == "post"), 
+                                                                   features = "gender", 
+                                                                   categories = "cluster") %>%
+  feature_rename()
+
+
+analysis_list[["uni_male"]] <- get_feature_summary(df = joined_data %>% filter(gender == "Male"), 
+                                                                  features = "pandemic", 
+                                                                  categories = "cluster") %>%
+  feature_rename()
+
+analysis_list[["uni_female"]] <- get_feature_summary(df = joined_data %>% filter(gender == "Female"), 
+                                                                  features = "pandemic", 
+                                                                  categories = "cluster") %>%
+  feature_rename()
+```
+
+## Race comparison
+Due to small numbers in other racial categories, only White and Black/African American patients were analyzed. 
+
+```{r}
+bw <- joined_data %>% filter(race != "Other") %>% mutate(race = factor(race, levels = c("White", "Black or African American")))
+
+analysis_list[["uni_pre_pandemic_race"]] <- get_feature_summary(df = bw %>% filter(pandemic == "pre"), 
+                                                                  features = "race", 
+                                                                  categories = "cluster") %>%
+  feature_rename()
+
+
+analysis_list[["uni_post_pandemic_race"]] <- get_feature_summary(df = bw %>% filter(pandemic == "post"), 
+                                                                   features = "race", 
+                                                                   categories = "cluster") %>%
+  feature_rename()
+
+
+analysis_list[["uni_white"]] <- get_feature_summary(df = bw %>% filter(race == "White"), 
+                                                                  features = "pandemic", 
+                                                                  categories = "cluster") %>%
+  feature_rename()
+
+analysis_list[["uni_AA"]] <- get_feature_summary(df = bw %>% filter(race == "Black or African American"), 
+                                                                  features = "pandemic", 
+                                                                  categories = "cluster") %>%
+  feature_rename()
+```
+
+# Figure 2
+
+```{r}
+
+propci <- function(x, n, conf_level = 0.95){
+  
+  # calculate critical value of given confidence level
+  alpha <- 1 - conf_level
+  alpha_crit <- 1-alpha/2
+  crit <- qnorm(alpha_crit)
+  
+  # calculate proportion
+  p <- x/n
+  
+  # calculate standard error of proportion
+  se <- sqrt((p * (1 - p)) / n)
+  
+  # calculate margin of error
+  me <- se * crit
+  
+  # calcualte upper and lower limits of confidence interval
+  upper <- p + me
+  lower <- p - me
+  
+  # clip ci to max 1 and min 0
+  if (upper > 1){
+    upper <- 1
+  }
+  
+  if (lower < 0){
+    lower <- 0
+  }
+  
+  # return ci
+  return(c(lower, upper))
+}
+
+
+joined_data <- joined_data %>% mutate(year = year(diabetes_date))
+
+for (c in order){
+  # calculate proportions
+  prop <- joined_data %>% 
+    group_by(year) %>% 
+    reframe(cluster = sum(cluster == c), 
+            n = n(), 
+            proportion = cluster/n, 
+            ci_lower = propci(cluster, n)[1], 
+            ci_upper = propci(cluster, n)[2])
+  
+  analysis_list[[paste(c, "proportion", sep = "_")]] <- prop
+  
+  prop_graph <- ggplot(prop, mapping = aes(x = year, y = proportion)) +
+    geom_point(size = 1, color = "darkgrey") +
+    geom_errorbar(aes(x = year, ymin = ci_lower, ymax = ci_upper),  width = 0.5, color = "darkgrey") +
+    geom_smooth(se = F, color = "red") +
+    geom_vline(xintercept = 2020, linetype = "dashed", color = "blue") + 
+    scale_x_continuous(labels = c("'10", "'15", "'20"), breaks = c(2010, 2015, 2020)) +
+    scale_y_continuous(limits = c(0, 0.8)) + 
+    theme_classic() + 
+    labs(x = "Year", y = "Proportion") + 
+    theme(axis.text.x = element_text(angle = 45, vjust = 0.5),
+          plot.margin = margin(0, 10, 0, 10)) # increase margin, clockwise from top, right, bottom, left
+  
+  # save
+  ggsave(file.path(export_dir, paste0("fig2_", c, "_trend.tiff")), plot = prop_graph, width = 5, height = 4.5, units = "cm", dpi = dpi)
+}
+
+
+
+
+```
+
+## Prop test
+
+```{r}
+
+
+prop_test_results <- joined_data %>% 
+  # build count table
+  group_by(cluster, pandemic) %>% 
+  summarise(n = n()) %>% 
+  pivot_wider(names_from = pandemic, values_from = n) %>% 
+  ungroup()
+  
+prop_p <- c()
+for (c in order){
+  p <- prop.test(c(prop_test_results %>% filter(cluster == c) %>% pull(pre),
+                   prop_test_results %>% filter(cluster == c) %>% pull(post)),
+                 c(nrow(pre_covid), nrow(post_covid)))
+  prop_p <- append(prop_p, p$p.value)
+}
+
+analysis_list[["uni_cluster_proportions"]] <- prop_test_results %>% 
+  mutate(z_test_p_value = prop_p)
+
+
+```
+
+
+## Per cluster comparison
+
+```{r}
+clusters <- c("SAID", "SIDD", "SIRD", "MOD", "MARD")
+
+for (c in clusters)
+  analysis_list[[paste("uni", c, sep = "_")]] <- get_feature_summary(df = joined_data %>% filter(cluster == c), 
+                                                                     features = c("race", "gender",
+                                                                                  ahlqvist, 
+                                                                                  #"deceased_age", # too few in SAID
+                                                                                  glucose_homeostasis,
+                                                                                  lipid,
+                                                                                  kidney),
+                                                                     categories = c("pandemic"),
+                                                                     covariates = NA) %>% feature_rename()
+```
+
+
+# Figure 3
+
+```{r}
+
+# within SIDD, proportion of each race
+for (r in c("White", "Black or African American")){
+  # calculate proportions
+  prop <- joined_data %>% 
+    filter(cluster == "SIDD") %>%
+    group_by(year) %>% 
+    reframe(race = sum(race == r), 
+            n = n(), 
+            proportion = race/n, 
+            ci_lower = propci(race, n)[1], 
+            ci_upper = propci(race, n)[2])
+  
+  analysis_list[[paste(r, "SIDD_proportion", sep = "_")]] <- prop
+  
+  prop_graph <- ggplot(prop, mapping = aes(x = year, y = proportion)) +
+    geom_point(size = 1, color = "darkgrey") +
+    geom_errorbar(aes(x = year, ymin = ci_lower, ymax = ci_upper),  width = 0.5, color = "darkgrey") +
+    geom_smooth(se = F, color = "red") +
+    geom_vline(xintercept = 2020, linetype = "dashed", color = "blue") + 
+    scale_x_continuous(labels = c("'10", "'15", "'20"), breaks = c(2010, 2015, 2020)) +
+    theme_classic() + 
+    labs(x = "Year", y = "Proportion") + 
+    theme(axis.text.x = element_text(angle = 45, vjust = 0.5),
+          plot.margin = margin(0, 10, 0, 10)) # increase margin, clockwise from top, right, bottom, left
+  
+  # save
+  ggsave(file.path(export_dir, paste("fig3", "SIDD", r, "trend.tiff", sep = "_")), plot = prop_graph, width = 5, height = 4.5, units = "cm", dpi = dpi)
+}
+
+
+# Proportion of each race that is SIDD
+for (r in c("White", "Black or African American")){
+  # calculate proportions
+  prop <- joined_data %>% 
+    filter(race == r) %>%
+    group_by(year) %>% 
+    reframe(cluster = sum(cluster == "SIDD"), 
+            n = n(), 
+            proportion = cluster/n, 
+            ci_lower = propci(cluster, n)[1], 
+            ci_upper = propci(cluster, n)[2])
+  
+  analysis_list[[paste(r, "SIDD_proportion", sep = "_")]] <- prop
+  
+  prop_graph <- ggplot(prop, mapping = aes(x = year, y = proportion)) +
+    geom_point(size = 1, color = "darkgrey") +
+    geom_errorbar(aes(x = year, ymin = ci_lower, ymax = ci_upper),  width = 0.5, color = "darkgrey") +
+    geom_smooth(se = F, color = "red") +
+    geom_vline(xintercept = 2020, linetype = "dashed", color = "blue") + 
+    scale_x_continuous(labels = c("'10", "'15", "'20"), breaks = c(2010, 2015, 2020)) +
+    scale_y_continuous(limits = c(0, 1)) + 
+    theme_classic() + 
+    labs(x = "Year", y = "Proportion") + 
+    theme(axis.text.x = element_text(angle = 45, vjust = 0.5),
+          plot.margin = margin(0, 10, 0, 10)) # increase margin, clockwise from top, right, bottom, left
+  
+  # save
+  ggsave(file.path(export_dir, paste("fig3", r, "SIDD_trend.tiff", sep = "_")), plot = prop_graph, width = 5, height = 4.5, units = "cm", dpi = dpi)
+}
+
+```
+
+
+Proportion test
+
+```{r}
+# for proportion of SIDD in each race
+prop_test_results <- joined_data %>% 
+  # build count table
+  filter(cluster == "SIDD") %>%
+  group_by(race, pandemic) %>% 
+  summarise(n = n()) %>% 
+  pivot_wider(names_from = pandemic, values_from = n) %>% 
+  ungroup()
+
+prop_p <- c()
+for (r in prop_test_results$race){
+  p <- prop.test(c(prop_test_results %>% filter(race == r) %>% pull(pre),
+                   prop_test_results %>% filter(race == r) %>% pull(post)),
+                 c(nrow(pre_covid %>% filter(race == r)), 
+                   nrow(post_covid %>% filter(race == r))))
+  prop_p <- append(prop_p, p$p.value)
+}
+
+analysis_list[["uni_SIDD_race_proportions"]] <- prop_test_results %>% 
+  mutate(z_test_p_value = prop_p)
+
+# within SIDD, proportion of each race
+prop_test_results <- joined_data %>% 
+  # build count table
+  filter(cluster == "SIDD") %>%
+  group_by(race, pandemic) %>% 
+  summarise(n = n()) %>% 
+  pivot_wider(names_from = pandemic, values_from = n) %>% 
+  ungroup()
+
+prop_p <- c()
+for (r in prop_test_results$race){
+  p <- prop.test(c(prop_test_results %>% filter(race == r) %>% pull(pre),
+                   prop_test_results %>% filter(race == r) %>% pull(post)),
+                 c(nrow(pre_covid %>% filter(cluster == "SIDD")), 
+                   nrow(post_covid %>% filter(cluster == "SIDD"))))
+  prop_p <- append(prop_p, p$p.value)
+}
+
+analysis_list[["uni_SIDD_race_proportions"]] <- prop_test_results %>% 
+  mutate(z_test_p_value = prop_p)
+```
+
+
+
+
+```{r}
+
+box_theme <- theme(axis.title.x = element_text(size = 8, color = "black"),
+                    axis.text.x = element_text(size = 8, color = "black"),
+                    axis.title.y = element_text(size = 8, color = "black"),
+                    axis.text.y = element_text(size = 8, color = "black"),
+                    axis.line = element_line(linewidth = 0.25, color = "black"),
+                    axis.ticks = element_line(linewidth = 0.25, color = "black"),
+                    plot.title = element_text(hjust = 0.5),
+                    legend.text=element_text(size = 8))
+
+age <- ggplot(data = joined_data, mapping = aes(x = pandemic, y = diabetes_age)) + 
+  geom_boxplot() +
+  theme_classic() + 
+  scale_x_discrete(labels = c("2010-2019", "2020-2024")) +
+  labs(x = "Year", y = "Diagnosis age (years)") + 
+  box_theme
+
+ggsave(file.path(export_dir, paste0("box_age.tiff")), plot = age, width = 5, height = 4.5, units = "cm", dpi = dpi)
+
+bmi <- ggplot(data = joined_data, mapping = aes(x = pandemic, y = bmi)) + 
+  geom_boxplot() +
+  theme_classic() + 
+  scale_x_discrete(labels = c("2010-2019", "2020-2024")) +
+  labs(x = "Year", y = bquote("BMI " (kg/m^2))) + 
+  box_theme
+
+ggsave(file.path(export_dir, paste0("box_bmi.tiff")), plot = bmi, width = 5, height = 4.5, units = "cm", dpi = dpi)
+
+deceased_age <- ggplot(data = joined_data, mapping = aes(x = pandemic, y = deceased_age)) + 
+  geom_boxplot() +
+  theme_classic() + 
+  scale_x_discrete(labels = c("2010-2019", "2020-2024")) +
+  labs(x = "Year", y = "Deceased age (years)") + 
+  box_theme
+
+ggsave(file.path(export_dir, paste0("box_deceased_age.tiff")), plot = deceased_age, width = 5, height = 4.5, units = "cm", dpi = dpi)
+
+ir <- ggplot(data = joined_data, mapping = aes(x = pandemic, y = homa_cpeptide_ir)) + 
+  geom_boxplot() +
+  theme_classic() + 
+  scale_x_discrete(labels = c("2010-2019", "2020-2024")) +
+  labs(x = "Year", y = "HOMA2-IR") + 
+  box_theme
+
+ggsave(file.path(export_dir, paste0("box_homa2ir.tiff")), plot = ir, width = 5, height = 4.5, units = "cm", dpi = dpi)
+
+
+```
+
+
+# Inpatient encounters
+
+```{r}
+get_feature_summary(df = joined_data, features = "inpatient", categories = "pandemic")
+
+joined_data %>% finalfit::finalfit("Surv(to_inpatient, inpatient)", c("race", "gender", "diabetes_age", "pandemic"))
+
+inpatient <- joined_data %>% filter(inpatient == 1)
+
+
+```
+
+```{r}
+inpatient %>% finalfit::finalfit("Surv(to_deceased, deceased)", c("race", "gender", "diabetes_age", "pandemic"))
+```
+
+
+Export results for graphing.
+
+```{r}
+# create export directory if doesn't exist
+export_dir <- "/data/user/brianlu/projects/precision_diabetes/COVID19_clusters/exports"
+export_dir <- file.path(export_dir, paste0("analysis_", Sys.Date()))
+if (!dir.exists(export_dir)) {
+  dir.create(export_dir, recursive = T)
+}
+
+# source data
+write_csv(joined_data, file.path(export_dir, "joined_data.csv"))
+
+# analysis
+#saveWorkbook(wb, file.path(export_dir, "characteristic_table.xlsx"), overwrite = TRUE)
+
+for (n in names(analysis_list)){
+  write_csv(analysis_list[[n]], file.path(export_dir, paste0(n, ".csv")))
+}
+```
+
+# Session Information
+
+```{r}
+sessionInfo()
+```
+
+
+fig1: pie chart for pre vs post, overall, male vs female, race
+fig2: trend line of proportion per year per cluster
+z test for pre vs post
+
+Per cluster and overall homa-ir, age, a1c, bmi
+
+refernces for covid and beta cells and insulin resistance
+
+outcome from hospital
+inpatient encounter, time to death, total inpatient encounter, per cluster
+
+
+
+```{r}
+# test population level SIRD
+prop.test(c(sum(pre_covid$SIRD == 1), sum(post_covid$SIRD == 1)),
+          c(nrow(pre_covid), nrow(post_covid)))
+
+# test population level MARD
+prop.test(c(sum(pre_covid$MARD == 1), sum(post_covid$MARD == 1)),
+          c(nrow(pre_covid), nrow(post_covid)))
+
+# 
+t.test(pre_covid$diabetes_age, post_covid$diabetes_age)
+t.test(pre_covid$homa_cpeptide_ir, post_covid$homa_cpeptide_ir)
+
+pre_sird <- pre_covid %>% filter(cluster == "SIRD")
+post_sird <- post_covid %>% filter(cluster == "SIRD")
+
+t.test(pre_sird$diabetes_age, post_sird$diabetes_age)
+```
+
+
+```{r}
+joined_data <- joined_data %>% 
+  mutate(severe = factor(case_when(cluster == "SIDD" | cluster == "SIRD" ~ "severe", 
+                                   cluster == "SAID" ~ "autoimmune",
+                                   cluster == "MARD" | cluster == "MOD" ~ "mild"),
+                         levels = c("mild", "severe", "autoimmune")))
+
+joined_data <- joined_data %>% 
+  mutate(severe = factor(case_when(cluster == "SIDD" | cluster == "SIRD" ~ "severe", 
+                                   cluster == "MOD" | cluster == "MARD" ~ "mild"),
+                         level = c("mild", "severe")),
+         SIDD_factor = factor(case_when(cluster == "SIDD" ~ "SIDD", .default = "Others"), 
+                              levels = c("Others", "SIDD")))
+
+joined_data <- joined_data %>% 
+  mutate(severe = factor(case_when(cluster == "SIDD" | cluster == "SIRD" ~ "severe", 
+                                   cluster == "MOD" | cluster == "MARD"| cluster == "SAID"~ "mild"),
+                         level = c("mild", "severe")),
+         SIDD_factor = factor(case_when(cluster == "SIDD" ~ "SIDD", .default = "Others"), 
+                              levels = c("Others", "SIDD")))
+
+joined_data <- joined_data %>% 
+  mutate(b_deficient = factor(case_when(cluster == "SIDD" | cluster == "SAID" ~ "deficient", 
+                                 .default = "not_deficient"), levels = c("not_deficient", "deficient")))
+
+joined_data <- joined_data %>%
+  mutate(year = year(diabetes_date),
+         year_increment = case_when(date_range == "y2010" ~ 0,
+                                    date_range == "y2015" ~ 1,
+                                    date_range == "y2020" ~ 2),
+         year_2 = floor(year(diabetes_date)/2-1005),
+         age_factor = floor(diabetes_age/10))
+
+joined_data %>% group_by(date_range) %>% summarise(SAID = sum(SAID == 1)/n(), 
+                                             SIDD = sum(SIDD == 1)/n(),
+                                             SIRD = sum(SIRD == 1)/n(),
+                                             MOD = sum(MOD == 1)/n(),
+                                             MARD = sum(MARD == 1)/n()) %>%
+  pivot_longer(cols = SAID:MARD, names_to = "cluster", values_to = "Proportion") %>% 
+  mutate(cluster = factor(cluster, levels = c("SAID", "SIDD", "SIRD", "MOD", "MARD", "severe"))) %>% 
+  ggplot(., mapping = aes(x = date_range, y = Proportion)) + geom_bar(stat = "identity") + theme_classic() +
+    facet_wrap(vars(cluster))
+
+
+joined_data %>% group_by(year_2) %>% summarise(SAID = sum(SAID == 1)/n(), 
+                                             SIDD = sum(SIDD == 1)/n(),
+                                             SIRD = sum(SIRD == 1)/n(),
+                                             MOD = sum(MOD == 1)/n(),
+                                             MARD = sum(MARD == 1)/n(),
+                                             severe = sum(severe == "severe")/n()) %>%
+  pivot_longer(cols = SAID:severe, names_to = "cluster", values_to = "Proportion") %>% 
+  mutate(cluster = factor(cluster, levels = c("SAID", "SIDD", "SIRD", "MOD", "MARD", "severe"))) %>% 
+  ggplot(., mapping = aes(x = year_2, y = Proportion)) + geom_smooth() + geom_point() + theme_classic() + geom_vline(xintercept = 5, linetype = "dashed") +
+    facet_wrap(vars(cluster))
+
+joined_data %>% group_by(year) %>% summarise(SAID = sum(SAID == 1)/n(), 
+                                             SIDD = sum(SIDD == 1)/n(),
+                                             SIRD = sum(SIRD == 1)/n(),
+                                             MOD = sum(MOD == 1)/n(),
+                                             MARD = sum(MARD == 1)/n(),
+                                             Severe = sum(severe == "severe")/n(),
+                                             Mild = sum(severe == "mild")/n()) %>%
+  pivot_longer(cols = SAID:Mild, names_to = "cluster", values_to = "Proportion") %>% 
+  mutate(cluster = factor(cluster, levels = c("SAID", "SIDD", "SIRD", "MOD", "MARD", "Severe", "Mild"))) %>% 
+  ggplot(., mapping = aes(x = year, y = Proportion)) + geom_smooth() + geom_point() + theme_classic() + geom_vline(xintercept = 2020, linetype = "dashed") +
+    facet_wrap(vars(cluster))
+
+
+joined_data %>% group_by(year, covid19_status) %>% summarise(
+                                             SAID = sum(SAID == 1)/n(), 
+                                             SIDD = sum(SIDD == 1)/n(),
+                                             SIRD = sum(SIRD == 1)/n(),
+                                             MOD = sum(MOD == 1)/n(),
+                                             MARD = sum(MARD == 1)/n(),
+                                             severe = sum(severe == "severe")/n()) %>%
+  pivot_longer(cols = SAID:severe, names_to = "cluster", values_to = "Proportion") %>% 
+  mutate(cluster = factor(cluster, levels = c("SAID", "SIDD", "SIRD", "MOD", "MARD", "severe"))) %>% 
+  ggplot(., mapping = aes(x = year, y = Proportion, color = covid19_status)) + geom_smooth() + geom_point() + theme_classic() + geom_vline(xintercept = 2020, linetype = "dashed") +
+    facet_wrap(vars(cluster))
+
+joined_data %>% group_by(year) %>% summarise(SIRD = sum(SIRD == 1)/n(),
+                                             MARD = sum(MARD == 1)/n(),
+                                             Others = sum(cluster != "SIRD" & cluster != "MARD")/n()) %>%
+  pivot_longer(cols = SIRD:Others, names_to = "cluster", values_to = "Proportion") %>% 
+  mutate(cluster = factor(cluster, levels = c("SIRD", "MARD", "Others"))) %>% 
+  ggplot(., mapping = aes(x = year, y = Proportion)) + geom_smooth() + geom_point() + theme_classic() + geom_vline(xintercept = 2020, linetype = "dashed") +
+    facet_wrap(vars(cluster))
+
+
+joined_data %>% select(diabetes_date, a1c, bmi, diabetes_age, homa_cpeptide_b, homa_cpeptide_ir) %>%
+  pivot_longer(cols = a1c:homa_cpeptide_ir, names_to = "feature", values_to = "value") %>%
+  ggplot(., mapping = aes(x = diabetes_date, y = value)) + 
+  geom_point(alpha = 0.25, size = 0.25) + 
+  geom_smooth() + 
+  facet_wrap(vars(feature), scale = "free") + 
+  theme_classic()
+
+joined_data %>% select(severe, diabetes_date, a1c, bmi, diabetes_age, homa_cpeptide_b, homa_cpeptide_ir) %>%
+  pivot_longer(cols = a1c:homa_cpeptide_ir, names_to = "feature", values_to = "value") %>%
+  ggplot(., mapping = aes(x = diabetes_date, y = value, color = severe)) + 
+  geom_point(alpha = 0.25, size = 0.25) + 
+  geom_smooth() + 
+  facet_wrap(vars(feature), scale = "free") + 
+  theme_classic()
+
+ggplot(joined_data, mapping = aes(x = diabetes_date, y = homa_cpeptide_ir, color = cluster)) +
+  geom_point(alpha = 0.25, size = 0.25) +
+  geom_smooth() + 
+  coord_cartesian(ylim = c(0, 10)) + 
+  theme_classic()
+
+
+joined_data %>% group_by(date_range) %>% summarise(
+    SAID = sum(SAID == 1)/n(), 
+    SIDD = sum(SIDD == 1)/n(),
+    SIRD = sum(SIRD == 1)/n(),
+    MOD = sum(MOD == 1)/n(),
+    MARD = sum(MARD == 1)/n(),
+    severe = sum(severe == "severe")/n()) %>%
+  pivot_longer(cols = SAID:severe, names_to = "cluster", values_to = "Proportions") %>%
+  mutate(cluster = factor(cluster, levels = c("SAID", "SIDD", "SIRD", "MOD", "MARD", "severe"))) %>%
+  ggplot(., mapping = aes(x = date_range, y = Proportions)) + geom_bar(stat = "identity") + facet_wrap(vars(cluster))
+
+
+```
+
+
+```{r}
+chisq.test(table(joined_data$cluster, joined_data$date_range))
+
+summary(glm(b_deficient ~ race + gender + diabetes_age + date_range + covid19_status, data = joined_data, family = "binomial"))
+
+summary(lm(homa_cpeptide_b ~ race + gender + diabetes_age + date_range + homa_cpeptide_ir + SIDD_factor * covid19_status,
+           data = joined_data))
+
+
+```
+
+# time to covid
+```{r}
+joined_data <- joined_data %>% 
+  mutate(gad_covid = case_when(gad_date >= covid19_date ~ 1, .default = 0),
+         a1c_covid = case_when(a1c_date >= covid19_date ~ 1, .default = 0),
+         bmi_covid = case_when(bmi_date >= covid19_date ~ 1, .default = 0),
+         homa_covid = case_when(homa_cpeptide_date >= covid19_date ~ 1, .default = 0),
+         diabetes_covid = case_when(diabetes_date >= covid19_date ~ 1, .default = 0))
+
+
+
+pre_covid_DE_ID <- joined_data %>% 
+  filter(covid19 == 1 & diabetes_covid == 0 & gad_covid == 0 & a1c_covid == 0 & bmi_covid == 0 & homa_covid == 0) %>% 
+  pull(DE_ID)
+
+covid_history <- post_covid %>% filter(DE_ID %in% pre_covid_DE_ID) %>% filter(covid19_code != "U07.1") %>% pull(DE_ID)
+
+# how do the 6 patients in covid_history line up with test dates?
+
+joined_data <- joined_data %>%
+  mutate(after_covid = case_when(diabetes_date >= covid19_date ~ 1,
+                                 gad_date >= covid19_date ~ 1,
+                                 a1c_date >= covid19_date ~ 1,
+                                 bmi_date >= covid19_date ~ 1,
+                                 homa_cpeptide_date >= covid19_date ~ 1,
+                                 # DE_ID %in% covid_history ~ 1,
+                                 .default = 0))
+
+```
+
+
+# Complications
+
+```{r}
+complication_names <- c("mi", "stroke", "neuropathy", "esrd", "nephropathy", "retinopathy", "nafld", "dka", "u_ketone_first_positive")
+for (c in complication_names){
+  diagnosis_date <- paste(c, "date", sep = "_")
+  joined_data <- joined_data %>%
+    mutate("to_{c}" := case_when(!is.na(.[[diagnosis_date]]) ~ as.numeric(.[[diagnosis_date]] - diabetes_date, "days")/365,
+                                 is.na(.[[diagnosis_date]]) & pandemic == "pre" ~ 
+                                   as.numeric(mdy("12-31-2019") - diabetes_date, "days")/365,
+                                 is.na(.[[diagnosis_date]]) & pandemic == "post" ~ 
+                                   as.numeric(ymd(covid_censored_date) - diabetes_date, "days")/365,
+                                 .default = NA) 
+          )
+}
+
+
+analysis <- list()
+for (i in c(complication_names)){
+  analysis[[i]] <- joined_data %>% finalfit::finalfit(paste0("Surv(to_", i, ", ", i, ")"), 
+                                c(covariates, "date_range", "cluster"), pval = TRUE)
+}
+```
+
+
+```{r}
+joined_data %>% finalfit::surv_plot("Surv(to_dka, dka)", "pandemic", fun = "event")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Overall risks of complications
+Analyze risks of complications in the entire cohort, in the AA patients only, and in the White patients only.
+
+```{r}
+# filter post_covid by race
+aa <- post_covid %>% filter(race == "Black or African American")
+white <- post_covid %>% filter(race == "White")
+
+# risks of MI by race
+for (comp in complications){
+  analysis_list[[paste("multi_overall", comp, sep = "_")]] <- logit_table(post_covid, comp, covariates) %>% 
+    arrange(factor(Value, levels = c("White", "Black or African American", "Other",
+                                     "Male", "Female")))
+  analysis_list[[paste("multi_aa", comp, sep = "_")]] <- logit_table(aa, comp, c("gender", "diabetes_age"))
+  analysis_list[[paste("multi_white", comp, sep = "_")]] <- logit_table(white, comp, c("gender", "diabetes_age"))
+  
+}
+
+```
+
+Analyze association between MI and potential risk factors.
+
+```{r}
+# association between MI and potential risk factors
+mi_features <- c("a1c",
+                 "homa_cpeptide_b_25",
+                 "homa_cpeptide_ir",
+                 "bmi_5",
+                 "cholesterol_50",
+                 "ldl_hdl",
+                 "non_hdl_50")
+
+for (m in mi_features){
+  analysis_list[[paste("multi_overall_mi", m, sep = "_")]] <- logit_table(post_covid, "mi", c(m, covariates)) %>% 
+    arrange(factor(Value, levels = c("White", "Black or African American", "Other",
+                                     "Male", "Female")))
+  analysis_list[[paste("multi_aa_mi", m, sep = "_")]] <- logit_table(aa, "mi", c(m, "gender", "diabetes_age"))
+  analysis_list[[paste("multi_white_mi", m, sep = "_")]] <- logit_table(white, "mi", c(m, "gender", "diabetes_age"))
+}
+
+```
+
+MI is associated with HbA1c and HOMA2-B in AA but not Whites. AA is known to have higher risks of nephropathy, which is associated with increased risks of MI. 
+
+```{r}
+neph_adjust <- c("a1c", "homa_cpeptide_b_25")
+
+for (n in neph_adjust){
+  analysis_list[[paste("multi_overall_mi_neph", n, sep = "_")]] <- logit_table(post_covid, "mi", c(n, covariates, "nephropathy")) %>% 
+    arrange(factor(Value, levels = c("White", "Black or African American", "Other",
+                                     "Male", "Female")))
+  analysis_list[[paste("multi_aa_mi_neph", n, sep = "_")]] <- logit_table(aa, "mi", c(n, "gender", "diabetes_age", "nephropathy"))
+  analysis_list[[paste("multi_white_mi_neph", n, sep = "_")]] <- logit_table(white, "mi", c(n, "gender", "diabetes_age", "nephropathy"))
+  
+  # interaction between race and a1c or homa2b
+  formula <- reformulate(c("gender_factor", paste("race_factor", n, sep = "*")), response = "mi")
+  model <- glm(formula, data = post_covid, family = "binomial")
+  conf <- exp(confint.default(model)) %>% as_tibble(rownames = "term")
+  coefs <- exp(coef(model)) %>% as_tibble(rownames = "term") %>% rename(OR = value)
+  analysis_list[[paste("multi_interaction_mi", n, sep = "_")]] <- summary(model)$coefficient %>% 
+    as_tibble(rownames = "term") %>%
+    left_join(coefs, by = join_by(term)) %>%
+    left_join(conf, by = join_by(term))
+}
+
+```
+
+# Insulin vs c-peptide HOMA2 estimates
+Construct new tibble to build linear regression models.
+
+```{r}
+homa <- post_covid %>% 
+  filter(!is.na(homa_insulin_b) & !is.na(homa_cpeptide_b) & insulin_date == cpeptide_date) %>%
+  #filter(insulin_date < insulin_order_date | is.na(insulin_order_date)) %>% # value must be prior to insulin prescription
+  filter(race != "Other") %>%
+  mutate(count = "1",
+         homab_dif = homa_cpeptide_b - homa_insulin_b, 
+         homair_dif = homa_cpeptide_ir - homa_insulin_ir ) # add to summarize by count later
+
+ic_b <- homa %>% 
+  select(DE_ID, race, gender, diabetes_age, homa_insulin_b, homa_cpeptide_b) %>%
+  pivot_longer(cols = c(homa_insulin_b, homa_cpeptide_b), names_to = "method", values_to = "homa2b") %>%
+  mutate(DE_ID = factor(DE_ID),
+         method = ifelse(.$method == "homa_insulin_b", "insulin", "cpeptide"))
+
+ic_ir <- homa %>%
+  select(DE_ID, race, gender, diabetes_age, homa_insulin_ir, homa_cpeptide_ir) %>%
+  pivot_longer(cols = c(homa_insulin_ir, homa_cpeptide_ir), names_to = "method", values_to = "homa2ir") %>%
+  mutate(DE_ID = factor(DE_ID),
+         method = ifelse(.$method == "homa_insulin_ir", "insulin", "cpeptide"))
+
+homa_ic <- full_join(ic_b, ic_ir, by = join_by(DE_ID, race, gender, diabetes_age, method))
+```
+
+Summarize and run paired t tests. The difference between HOMA2-B estimated from c-peptide and insulin are not significant in White patients, but the difference between HOMA2-B estimated from c-peptide and insulin are significant in Black/African American patients.
+
+```{r}
+b_summary <- get_feature_summary(homa,
+                                 c("homa_insulin_b", "homa_cpeptide_b"),
+                                 "race",
+                                 c("gender", "diabetes_age"),
+                                 distribution_stat = "ci") %>%
+  mutate(`Overall paired p-value` = t.test(homa2b ~ method, data = homa_ic, paired = T)$p.value,
+         `White paired p-value` = t.test(homa2b ~ method, data = homa_ic %>% filter(race == "White"), paired = T)$p.value,
+         `AA paired p-value` = t.test(homa2b ~ method, data = homa_ic %>% filter(race == "Black or African American"), paired = T)$p.value)
+
+ir_summary <- get_feature_summary(homa,
+                                 c("homa_insulin_ir", "homa_cpeptide_ir"),
+                                 "race",
+                                 c("gender", "diabetes_age"),
+                                 distribution_stat = "ci",
+                                 digits = 2) %>%
+  mutate(`Overall paired p-value` = t.test(homa2b ~ method, data = homa_ic, paired = T)$p.value,
+         `White paired p-value` = t.test(homa2ir ~ method, data = homa_ic %>% filter(race == "White"), paired = T)$p.value,
+         `AA paired p-value` = t.test(homa2ir ~ method, data = homa_ic %>% filter(race == "Black or African American"), paired = T)$p.value)
+
+count_summary <- get_feature_summary(homa, "count", "race")
+
+analysis_list$uni_homa_race <- full_join(b_summary, ir_summary) %>% full_join(count_summary)
+```
+
+Differences within AA or White.
+
+```{r}
+# AA homa2-b
+homa2b_for <- reformulate(termlabels = c(covariates[covariates != "race"], "method", "(1 | DE_ID)"), "homa2b")
+mod <- lmer(homa2b_for, data = homa_ic %>% filter(race == "Black or African American"))
+analysis_list$multi_homa2b_aa_lme <- anova(mod, type = "II", ddf = "Satterthwaite") %>% as_tibble(rownames = "terms")
+
+# AA homa2-ir
+homa2ir_for <- reformulate(termlabels = c(covariates[covariates != "race"], "method", "(1 | DE_ID)"), "homa2ir")
+mod <- lmer(homa2ir_for, data = homa_ic %>% filter(race == "Black or African American"))
+analysis_list$multi_homa2ir_aa_lme <- anova(mod, type = "II", ddf = "Satterthwaite") %>% as_tibble(rownames = "terms")
+
+# White homa2-b
+homa2b_for <- reformulate(termlabels = c(covariates[covariates != "race"], "method", "(1 | DE_ID)"), "homa2b")
+mod <- lmer(homa2b_for, data = homa_ic %>% filter(race == "White"))
+analysis_list$multi_homa2b_white_lme <- anova(mod, type = "II", ddf = "Satterthwaite") %>% as_tibble(rownames = "terms")
+
+# White homa2-ir
+homa2ir_for <- reformulate(termlabels = c(covariates[covariates != "race"], "method", "(1 | DE_ID)"), "homa2ir")
+mod <- lmer(homa2ir_for, data = homa_ic %>% filter(race == "White"))
+analysis_list$multi_homa2ir_white_lme <- anova(mod, type = "II", ddf = "Satterthwaite") %>% as_tibble(rownames = "terms")
+```
+
+Fit linear mixed-effects model to test for difference in race.
+
+```{r}
+# homa2-b
+homa2b_for <- reformulate(termlabels = c(covariates, "method", "method:race", "(1 | DE_ID)"), "homa2b")
+mod <- lmer(homa2b_for, data = homa_ic)
+analysis_list$multi_homa2b_race_lme <- anova(mod, type = "II", ddf = "Satterthwaite") %>% as_tibble(rownames = "terms")
+
+# homa2-ir
+homa2ir_for <- reformulate(termlabels = c(covariates, "method", "method:race", "(1 | DE_ID)"), "homa2ir")
+mod <- lmer(homa2ir_for, data = homa_ic)
+analysis_list$multi_homa2ir_race_lme <- anova(mod, type = "II", ddf = "Satterthwaite") %>% as_tibble(rownames = "terms")
+```
+
+# Cluster characteristics
+
+```{r}
+analysis_list$char_mapped <- get_feature_summary(post_covid, 
+                                                 features = c(ahlqvist, 
+                                                              # "race", # workspace too small to calculate p for fisher.test
+                                                              "gender",
+                                                              # demo, # no deceased in SAID, causes error
+                                                              complications,
+                                                              glucose_homeostasis,
+                                                              liver,
+                                                              lipid,
+                                                              kidney,
+                                                              prescription),
+                                                 categories = "mapped_cluster", 
+                                                 distribution_stat = "ci") %>% feature_rename() %>% rename(`Unadjusted p-value` = `Mapped_cluster p-value`)
+```
+
+Distribution of cluster assignment appears different by gender, particularly in the SIDD cluster.
+
+```{r}
+post_covid %>% 
+  calc_cat_summary(df = ., features = "mapped_cluster", categories = "gender") %>% 
+  reorder_columns() %>% 
+  arrange(factor(Value, levels = c("SAID", "SIDD", "SIRD", "MOD", "MARD")))
+```
+
+Distribution of cluster assignment does not appear different by race.
+
+```{r}
+post_covid %>% 
+  filter(race != "Other") %>% 
+  calc_cat_summary(df = ., features = "mapped_cluster", categories = "race") %>% 
+  reorder_columns() %>% 
+  arrange(factor(Value, levels = c("SAID", "SIDD", "SIRD", "MORD", "MARD")))
+```
+
+Cluster distribution is not even in White patients.
+
+```{r}
+chisq.test(table(white$Ahlqvist))
+```
+
+Cluster distribution is not even in Black/African American patients.
+
+```{r}
+chisq.test(table(aa$Ahlqvist))
+```
+
+
+# MARD vs other clusters
+MARD appears to generally have the mildest phenotype.
+
+```{r}
+analysis_list$char_mard_v_others <- get_feature_summary(post_covid, 
+                                                      features = c(ahlqvist, 
+                                                                   "race", "gender", demo, 
+                                                                   complications, 
+                                                                   glucose_homeostasis, 
+                                                                   liver, 
+                                                                   lipid, 
+                                                                   kidney, 
+                                                                   prescription),
+                                                      categories = c("MARD"),
+                                                      covariates = covariates) %>%
+  rename("Other" = "0",
+         "MARD" = "1") %>% 
+  feature_rename() %>% rename(`Unadjusted p-value` = `Mard p-value`, `Adjusted p-value` = `Mard adjusted p-value`)
+```
+
+## Demogrpahics
+
+Logistic regression was used to determine if the odds of being assigned to the MARD cluster is significantly different with race. Covariates for regression model were chosen based on background knowledge.
+
+```{r}
+analysis_list$multi_mard_v_other_cluster <- logit_table(post_covid, 
+                                                 "MARD", 
+                                                 covariates) %>%
+  rename("Other" = "0",
+         "MARD" = "1") %>%
+  arrange(factor(Value, levels = c("White", "Black or African American", "Other",
+                                   "Male", "Female")))
+
+```
+
+## Complications
+Aggregate complication risks.
+
+```{r}
+analysis_list$multi_mard_agg_comp <- logit_table(post_covid,
+                                                 "complications_all",
+                                                 c("MARD", covariates)) %>%
+    rename("No" = "0",
+           "Yes" = "1") %>%
+    arrange(factor(Value, levels = c("Yes", "No",
+                                     "White", "Black or African American", "Other",
+                                     "Male", "Female"))) 
+
+analysis_list$multi_mard_agg_comp_wo_nafld <- logit_table(post_covid,
+                                                 "complications_except_nafld",
+                                                 c("MARD", covariates)) %>%
+    rename("No" = "0",
+           "Yes" = "1") %>%
+    arrange(factor(Value, levels = c("Yes", "No",
+                                     "White", "Black or African American", "Other",
+                                     "Male", "Female"))) 
+```
+
+Individual complication risks.
+
+```{r}
+odds <- c("u_ketone_first_positive", "mi", "neuropathy", "nephropathy", "retinopathy", "nafld")
+
+for (o in odds){
+  analysis_list[[paste("multi_mard", o, sep = "_")]] <- logit_table(post_covid, 
+                                                                    o,
+                                                                    c("MARD", covariates)) %>%
+    rename("No" = "0",
+           "Yes" = "1") %>%
+    arrange(factor(Value, levels = c("Yes", "No",
+                                     "White", "Black or African American", "Other",
+                                     "Male", "Female"))) 
+}
+
+```
+
+# AA vs White in MARD cluster
+
+```{r}
+mard_w_aa <- post_covid %>% filter((Ahlqvist == "MARD") & (race == "White" | race == "Black or African American"))
+
+analysis_list$char_mard_w_v_aa <- get_feature_summary(mard_w_aa, 
+                                                    features = c(ahlqvist[ahlqvist != "gad"], 
+                                                                 "gender", demo, 
+                                                                 complications, 
+                                                                 glucose_homeostasis, 
+                                                                 liver, 
+                                                                 lipid, 
+                                                                 kidney, 
+                                                                 prescription),
+                                                    categories = "race",
+                                                    covariates = covariates[covariates != "race"]) %>% 
+  feature_rename() %>% 
+  rename(`Unadjusted p-value` = `Race p-value`, `Adjusted p-value` = `Race adjusted p-value`)
+
+odds <- c("u_ketone_first_positive", "mi", "neuropathy", "nephropathy", "retinopathy", "nafld")
+
+for (o in odds){
+
+  analysis_list[[paste("multi_mard_waa", o, sep = "_")]] <- logit_table(mard_w_aa,
+                                                                    o,
+                                                                    covariates) %>%
+    rename("No" = "0",
+           "Yes" = "1") %>%
+    arrange(factor(Value, levels = c("Yes", "No", 
+                                     "White", "Black or African American", "Other",
+                                     "Male", "Female")))
+
+}
+```
+
+# SAID vs other clusters
+
+Since SAID should be analogous to type 1 diabetes, insulin prescription should be higher in SAID compared to other clusters.
+
+```{r}
+# unadjusted
+analysis_list$uni_or_said_insulin_prescription <- logit_table(post_covid, 
+                                                                 "insulin_prescription", 
+                                                                 "SAID") %>%
+  rename("No insulin prescription" = "0",
+         "Insulin prescription" = "1")
+```
+
+Similarly, urine ketone should also be higher. However, urine ketone was not significantly higher in SAID compared to other clusters.
+
+```{r}
+# unadjusted
+analysis_list$uni_or_said_u_ketone <- logit_table(post_covid, 
+                                                 "u_ketone_first_positive", 
+                                                 "SAID") %>%
+  rename("No urine ketone" = "0",
+         "Urine ketone" = "1")
+
+```
+
+Since SIDD is defined by its relatively low beta cell function, urine ketone could also be higher in SIDD compared to other clusters, which could be masking the expected higher urine ketone in SAID. Indeed, the odds ratio of having a positive urine ketone in SAID was almost significant compared to all other clutsers except SIDD.
+
+```{r}
+no_sidd <- post_covid %>% filter(Ahlqvist != "SIDD")
+
+analysis_list$uni_or_said_no_sidd_u_ketone <- logit_table(no_sidd, 
+                                                 "u_ketone_first_positive", 
+                                                 "SAID") %>%
+  rename("No urine ketone" = "0",
+         "Urine ketone" = "1")
+
+```
+
+SIDD and SAID have similar odds ratio of having a positive urine ketone test.
+
+```{r}
+said_sidd <- post_covid %>% filter(Ahlqvist == "SAID" | Ahlqvist == "SIDD")
+
+analysis_list$uni_or_sidd_said_u_ketone <- logit_table(said_sidd, 
+                                                 "u_ketone_first_positive", 
+                                                 "SIDD") %>%
+  rename("No urine ketone" = "0",
+         "Urine ketone" = "1")
+```
+
+# SIDD vs other clusters
+
+```{r}
+
+analysis_list$char_sidd_v_others <- get_feature_summary(post_covid, 
+                                                      features = c(ahlqvist, 
+                                                                   "race", "gender", demo, 
+                                                                   complications, 
+                                                                   glucose_homeostasis, 
+                                                                   liver, 
+                                                                   lipid, 
+                                                                   kidney, 
+                                                                   prescription),
+                                                      categories = c("SIDD"),
+                                                      covariates = covariates) %>%
+  rename("Other" = "0",
+         "SIDD" = "1") %>% 
+  feature_rename() %>% rename(`Unadjusted p-value` = `Sidd p-value`, `Adjusted p-value` = `Sidd adjusted p-value`)
+```
+
+## Demogrpahics
+
+Logistic regression was used to determine if the odds of being assigned to the SIDD cluster is significantly different with race. Covariates for regression model were chosen based on background knowledge.
+
+```{r}
+analysis_list$multi_sidd_v_other_cluster <- logit_table(post_covid, 
+                                                 "SIDD", 
+                                                 covariates) %>%
+  rename("Other" = "0",
+         "SIDD" = "1") %>%
+  arrange(factor(Value, levels = c("White", "Black or African American", "Other",
+                                   "Male", "Female")))
+
+analysis_list$multi_sidd_aa_factor <- logit_table(post_covid, 
+                                                 "aa_factor", 
+                                                 c("SIDD", "gender", "diabetes_age")) %>%
+  rename("Other" = "0",
+         "AA" = "1")
+
+```
+
+## Prescription
+
+While the high percentage of patients with insulin prescription in SAID is expected, the percentage of patients with insulin prescription was also higher in SIDD compared to other clusters.
+
+```{r}
+analysis_list$multi_sidd_insulin_prescription <- logit_table(post_covid, 
+                                                                 "insulin_prescription", 
+                                                                 c("SIDD", covariates)) %>%
+  rename("No insulin prescription" = "0",
+         "Insulin prescription" = "1")
+
+analysis_list$multi_sidd_said_insulin_prescription <- logit_table(said_sidd, 
+                                                                 "insulin_prescription", 
+                                                                 c("SIDD", covariates)) %>%
+  rename("No insulin prescription" = "0",
+         "Insulin prescription" = "1")
+```
+
+## SIDD complications
+Aggregate complication risks.
+
+```{r}
+analysis_list$multi_sidd_agg_comp <- logit_table(post_covid,
+                                                 "complications_all",
+                                                 c("SIDD", covariates)) %>%
+    rename("No" = "0",
+           "Yes" = "1") %>%
+    arrange(factor(Value, levels = c("Yes", "No",
+                                     "White", "Black or African American", "Other",
+                                     "Male", "Female"))) 
+
+analysis_list$multi_sidd_agg_comp_wo_nafld <- logit_table(post_covid,
+                                                 "complications_except_nafld",
+                                                 c("SIDD", covariates)) %>%
+    rename("No" = "0",
+           "Yes" = "1") %>%
+    arrange(factor(Value, levels = c("Yes", "No",
+                                     "White", "Black or African American", "Other",
+                                     "Male", "Female"))) 
+```
+
+Individual complication risks.
+
+While the odds of patients in the SIDD cluster with a positive urine ketone test was higher than that of other clusters, the odds of being diagnosed with DKA was not significantly higher.
+
+SIDD patients have higher odds of neuropathy, MI, and urine ketone. 
+
+```{r}
+for (comp in complications){
+  # unadjusted
+  analysis_list[[paste("uni_or_sidd", comp, sep = "_")]] <- logit_table(post_covid, 
+                                                                        comp, 
+                                                                        "SIDD") %>%
+    rename("No" = "0",
+           "Yes" = "1")
+  
+  # adjusted for demographic covariates
+  analysis_list[[paste("multi_sidd", comp, sep = "_")]] <- logit_table(post_covid, 
+                                                                       comp, 
+                                                                       c("SIDD", covariates)) %>%
+    rename("No" = "0",
+           "Yes" = "1") %>%
+    arrange(factor(Value, levels = c("Yes", "No", 
+                                     "White", "Black or African American", "Other",
+                                     "Male", "Female")))
+  
+   }
+```
+
+# White vs AA in SIDD cluster
+
+```{r}
+w_aa <- post_covid %>% filter((Ahlqvist == "SIDD") & (race == "White" | race == "Black or African American"))
+
+analysis_list$char_sidd_w_v_aa <- get_feature_summary(w_aa, 
+                                                    features = c(ahlqvist[ahlqvist != "gad"], 
+                                                                 "gender", demo, 
+                                                                 complications, 
+                                                                 glucose_homeostasis, 
+                                                                 liver, 
+                                                                 lipid, 
+                                                                 kidney, 
+                                                                 prescription),
+                                                    categories = "race",
+                                                    covariates = covariates[covariates != "race"]) %>% 
+  feature_rename() %>% 
+  rename(`Unadjusted p-value` = `Race p-value`, `Adjusted p-value` = `Race adjusted p-value`)
+```
+
+## Race and Complications
+Logistic regression to determine odds ratios.
+
+```{r}
+odds <- c("u_ketone_first_positive", "mi", "neuropathy", "nephropathy", "retinopathy", "nafld")
+
+for (o in odds){
+
+  analysis_list[[paste("multi_sidd_waa", o, sep = "_")]] <- logit_table(w_aa,
+                                                                    o,
+                                                                    covariates) %>%
+    rename("No" = "0",
+           "Yes" = "1") %>%
+    arrange(factor(Value, levels = c("Yes", "No", 
+                                     "White", "Black or African American", "Other",
+                                     "Male", "Female")))
+
+}
+
+```
+
+# Calculate n for figures
+
+```{r}
+analysis_list$figure1_n <- post_covid %>% 
+  group_by(Ahlqvist) %>%
+  summarize(n = n())
+
+analysis_list$figure2_n <- post_covid %>% 
+  group_by(Ahlqvist) %>%
+  summarize(male = sum(gender == "Male"),
+            female = sum(gender == "Female"),
+            white = sum(race == "White"),
+            AA = sum(race == "Black or African American"))
+
+analysis_list$figure3_n <- post_covid %>% 
+  group_by(SIDD) %>%
+  summarize(homa2b = sum(!is.na(homa_cpeptide_b)),
+            cpeptide = sum(!is.na(cpeptide)),
+            glucose = sum(!is.na(glucose)),
+            a1c = sum(!is.na(a1c)),
+            non_hdl = sum(!is.na(non_hdl)),
+            triglyceride_hdl = sum(!is.na(triglyceride_hdl)),
+            diabetes_age = sum(!is.na(diabetes_age)),
+            deceased_age = sum(!is.na(deceased_age)))
+
+analysis_list$figure4_n <- w_aa %>% 
+  group_by(race) %>%
+  summarize(homa2b = sum(!is.na(homa_cpeptide_b)),
+            cpeptide = sum(!is.na(cpeptide)),
+            glucose = sum(!is.na(glucose)),
+            a1c = sum(!is.na(a1c)),
+            bmi = sum(!is.na(bmi)),
+            homa2ir = sum(!is.na(homa_cpeptide_ir)),
+            non_hdl = sum(!is.na(non_hdl)),
+            triglyceride_hdl = sum(!is.na(triglyceride_hdl)))
+
+analysis_list$figure5_n <- post_covid %>% 
+  group_by(MARD) %>%
+  summarize(diabetes_age = sum(!is.na(diabetes_age)),
+            deceased_age = sum(!is.na(deceased_age)),
+            glucose = sum(!is.na(glucose)),
+            a1c = sum(!is.na(a1c)),
+            bmi = sum(!is.na(bmi)),
+            homa2ir = sum(!is.na(homa_cpeptide_ir)),
+            non_hdl = sum(!is.na(non_hdl)),
+            triglyceride_hdl = sum(!is.na(triglyceride_hdl)))
+
+analysis_list$text_homa2_n <- homa_ic %>% group_by(method) %>% summarize(homa2b = length(homa2b),
+                                                                   homa2ir = length(homa2ir),
+                                                                   White = sum(race == "White"),
+                                                                   AA = sum(race == "Black or African American"),
+                                                                   Other = sum(race == "Other"),
+                                                                   Male = sum(gender == "Male"),
+                                                                   Female = sum(gender == "Female"))
+  
+```
+
+
+# Export results
+Create characteristic table for Supplemental Table S1.
+
+```{r}
+
+s1_feature_order <- c("Gender", "Race",
+                      "HbA1c", "BMI", "Diagnosis age", 
+                      "HOMA2-B", "HOMA2-IR", "Glucose", "C-peptide", 
+                      "Cholesterol", "LDL", "HDL", "Triglycerides", 
+                      "Urine albumin")
+
+s1_features <- c("gender", "race",
+                 "bmi", "diabetes_age", 
+                 "homa_cpeptide_b", "glucose", 
+                 "cholesterol", "ldl", "hdl", "triglyceride", 
+                 "u_albumin")
+
+s1_features_decimal <- c("a1c", "homa_cpeptide_ir", "cpeptide")
+
+
+table_s1_int <- get_feature_summary(post_covid, s1_features, "Ahlqvist", distribution_stat = "ci", digits = 0) %>% 
+  feature_rename() %>% 
+  rename(P = `Ahlqvist p-value`)
+table_s1_decimal <- get_feature_summary(post_covid, s1_features_decimal, "Ahlqvist", distribution_stat = "ci", digits = 1) %>% 
+  feature_rename() %>% 
+  rename(P = `Ahlqvist p-value`)
+
+table_s1 <- full_join(table_s1_int, table_s1_decimal)
+
+table_s1 <- table_s1 %>% 
+  select(Features, Value, SAID, SIDD, SIRD, MOD, MARD, P) %>% # subset to relevant columns 
+  filter(!grepl("No|Female|White|Other", .$Value))
+
+# rearrange rows to order supplied
+table_s1$Features <- factor(table_s1$Features, levels = s1_feature_order)
+table_s1 <- table_s1 %>% arrange(Features)
+
+# format Feature with units
+table_s1 <- table_s1 %>%
+  mutate(Features = case_when(Features == "Gender" ~ "Male",
+                              Features == "Race" ~ "AA",
+                              .default = Features),
+         Value = case_when(Value == "Yes" ~ "(% pos)", # change unit values
+                           Value == "Years" ~ "(years)",
+                           Value == "kg/m^2" ~ "(kg/m2)",
+                           Features == "HOMA2-B" | Features == "HOMA2-IR" ~ "",
+                           Features == "Male" | Features == "AA" ~ "(%)",
+                           .default = paste0("(", Value, ")"))) %>%
+  mutate(Features = trimws(paste(Features, Value))) %>% # paste units to feature names
+  select(-Value) # remove unit column
+
+# add line break
+for (c in order){
+  #table_s1[[c]] <- str_replace_all(table_s1[[c]], "\\d* \\((\\d*)\\)", "\\1")
+  table_s1[[c]] <- str_replace_all(table_s1[[c]], ", ", "-")
+  table_s1[[c]] <- str_replace_all(table_s1[[c]], " \\(", "\n\\(")
+}
+
+# add counts and frequency row
+s1_n <- post_covid %>% count(Ahlqvist) %>% pivot_wider(names_from = Ahlqvist, values_from  = n)
+s1_freq <- as_tibble(round(prop.table(s1_n) * 100, 0)) %>% mutate(across(everything(), as.character)) %>% mutate(Features = "Frequency (%)")
+s1_n <- s1_n %>% mutate(across(everything(), as.character)) %>% mutate(Features = "N")
+table_s1 <- bind_rows(s1_n, s1_freq, table_s1)
+
+# reorder columns
+table_s1 <- table_s1 %>% select(Features, {{order}}, P) %>% 
+  rename(Clusters = Features) %>%
+  mutate(P = case_when(as.numeric(P) > 0.05 ~ paste0("(", as.numeric(P), ")"), .default = P)) # parenthesis p > 0.05
+
+```
+
+Combine univariate analysis tables into Excel workbook.
+
+```{r}
+# create workbook
+wb <- createWorkbook()
+
+# define sheet styles
+header_style <- createStyle(textDecoration = "Bold", border = c("top", "bottom", "left", "right") , halign = "center", valign = "center")
+sheet_style <- createStyle(border = c("top", "bottom", "left", "right"), halign = "center", valign = "center")
+
+# define names to loop through
+analysis_names <- c("char_ahlqvist", "char_mard_v_others", "char_sidd_v_others", "char_sidd_w_v_aa")
+excel_names <- c("Cluster Characteristics", "MARD vs Others", "SIDD vs Others", "SIDD AA vs White")
+
+
+for (i in 1:length(analysis_names)){
+  # rearrange race rows
+  if ("Race" %in% analysis_list[[analysis_names[i]]]$Features){
+    # find rows
+    white_index <- match("White", analysis_list[[analysis_names[i]]]$Value)
+    aa_index <- match("Black or African American", analysis_list[[analysis_names[i]]]$Value)
+    
+    # slice out row with AA
+    aa_row <- slice(analysis_list[[analysis_names[i]]], aa_index)
+    
+    # remove row from original and add back in correct position
+    analysis_list[[analysis_names[i]]] <- analysis_list[[analysis_names[i]]] %>% 
+      filter(row_number() != aa_index) %>% 
+      add_row(aa_row, .after = white_index)
+  }
+  
+  # remove duplicated features to merge
+  dup <- duplicated(analysis_list[[analysis_names[i]]]$Features)
+  excel_formatted <- analysis_list[[analysis_names[i]]] %>% mutate(Features = case_when(dup ~ NA, .default = Features),
+                    Summary = case_when(dup ~ NA, .default = Summary),
+                    `Unadjusted p-value` = case_when(dup ~ NA, .default = `Unadjusted p-value`))
+  
+  # create and write excel sheet
+  addWorksheet(wb, sheetName = excel_names[i], gridLines = F)
+  writeData(wb, sheet = excel_names[i], x = excel_formatted, borders = "all", headerStyle = header_style)
+  
+  # find features that span multiple rows
+  dup_features <- analysis_list[[analysis_names[i]]] %>% count(across(Features)) %>% filter(n > 1) %>% pull(Features)
+  
+  # find indices of columns to merge
+  merge_cols <- which(colnames(analysis_list[[analysis_names[i]]]) %in% c("Features", "Summary", "Unadjusted p-value"))
+  
+  # loop to merge
+  for (f in dup_features){
+    # find starting and ending row indices containing feature
+    dup_index <- which(analysis_list[[analysis_names[i]]]$Features == f)
+    first_index <- min(dup_index)+1
+    last_index <- max(dup_index)+1
+    
+    for (c in merge_cols){
+      # merge columns containing feature name, summary, and p-value
+      mergeCells(wb, excel_names[i], cols = c, rows = first_index:last_index)
+      
+    }
+    
+  }
+  
+  # center align entire sheet
+  addStyle(wb, excel_names[i], sheet_style, 
+           rows = 1:nrow(excel_formatted) + 1, # start at 1 to skip header row
+           cols = 1:ncol(excel_formatted), gridExpand = T)
+  
+  # set column width
+  setColWidths(wb, excel_names[i], cols = 1:ncol(excel_formatted), widths = "auto")
+}
+
+
+# add supplemental table 1
+addWorksheet(wb, sheetName = "Table S1", gridLines = F)
+writeData(wb, sheet = "Table S1", x = table_s1, borders = "none", 
+          headerStyle = createStyle(textDecoration = "Bold", border = c("top", "bottom"), halign = "center", valign = "center"))
+# bold first column
+addStyle(wb, "Table S1", createStyle(textDecoration = "Bold", halign = "left", valign = "center"), 
+         rows = 2:(nrow(table_s1) + 1), # skip header row
+         cols = 1, gridExpand = T)
+# fix formatting for first cell
+# addStyle(wb, "Table S1", createStyle(textDecoration = "Bold", halign = "left", valign = "center", border = c("top", "bottom")), 
+#          rows = 1, 
+#          cols = 1, gridExpand = T)
+# center align sheet except first and last column
+addStyle(wb, "Table S1", createStyle(textDecoration = NULL, halign = "center", valign = "center"), 
+         rows = 1:nrow(table_s1) + 1, # skip header row
+         cols = 2:ncol(table_s1), gridExpand = T) # except first column
+# italicize p-value
+addStyle(wb, "Table S1", createStyle(textDecoration = "italic", halign = "center", valign = "center", fontSize = 9), 
+         rows = 3:nrow(table_s1) + 1, # skip header row
+         cols = ncol(table_s1), gridExpand = T)
+# set column width
+setColWidths(wb, "Table S1", cols = 1:ncol(table_s1), widths = "auto")
+```
+
+

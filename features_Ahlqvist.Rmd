@@ -1,0 +1,349 @@
+---
+title: "feature_engineering_Ahlqvist"
+author: "Brian Lu"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+    df_print: paged
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Overview
+Although diabetes is broadly classified as type 1 and type 2 diabetes, type 2 diabetes is known to be heterogeneous. Finer classifications of diabetes could aid in the personalization of diabetes treatment. [Ahlqvist et al.](https://doi.org/10.1016/s2213-8587(18)30051-2) recently identified 5 subtypes of diabetes with different risks of diabetic complications using glutamate decarboxylase antibody status, age at diagnoses, body mass index, HbA1c, and homeostatic model assessment 2 estimates of beta-cell function and insulin resistance. 
+
+**Objective:** Extract and clean the records from the UAB Health Systems required to reproduce the Ahlqvist clusters.
+
+# Environment set up
+```{r}
+library(RSQLite)
+library(tidyverse)
+```
+
+# Feature extraction
+Diabetes records from 2020 to 2024 were downloaded from the University of Alabama at Birmingham's (UAB) Health System by Andrew Crouse onto Microsoft Teams. The records were uploaded to Cheaha and imported into the `crouse_2024-06-17.db` SQL database using SQLite. 
+
+The required records were retrieved from `crouse_2024-06-17.db` as separate tibbles. 
+
+```{r}
+# connect to SQL database
+database_path <- "/data/user/brianlu/projects/precision_diabetes/SQL_database/crouse_2024-06-17.db"
+conn <- dbConnect(RSQLite::SQLite(), database_path)
+```
+
+To reproduce the subgroups described by [Ahlqvist et al.](https://doi.org/10.1016/s2213-8587(18)30051-2), the following 6 features were required:
+
+1. Glutamate decarboxylase antibodies
+2. Age at diagnosis
+3. Body mass index
+4. HbA1c
+5. Homeostatic model assessment 2 (HOMA2) estimates of beta cell function
+6. HOMA2 estimates of insulin resistance
+
+HOMA2 estimates can be calculated using fasting glucose and c-peptide or insulin.
+
+Patient birthdays were retrieved from the `patient_demographics` table. Age at diagnoses will be calculated from diagnosis date and birth date. 
+
+```{r}
+## patient demographics
+patient <- dbGetQuery(conn, "SELECT DE_ID, BIRTH_DATE FROM patient_demographics") %>% as_tibble()
+```
+
+Patient body mass index was retrieved from the `observations` table.
+
+```{r}
+# body mass index
+# No OMOP file, get from diagnoses instead
+bmi <- dbGetQuery(conn, 'SELECT DE_ID, DE_ID_VISIT_NUMBER, DIAG_DT_TM, DIAG_TYPE, VOCABULARY, CODE_VALUE, CODE_DESCRIPTION 
+                        FROM diagnoses
+                        WHERE CODE_DESCRIPTION LIKE "%BMI%" or CODE_DESCRIPTION LIKE "%Body mass index%"') %>% as_tibble()
+```
+
+Glucose, insulin, c-peptide, hemoglobin a1c, and GAD65 results were retrieved from the `lab_orders` tables.
+
+```{r}
+lab <- list()
+years <- seq(2020, 2024)
+
+where <- c("LOINC = '2345-7'", # glucose
+           "LOINC = '20448-7'", # insulin
+           "LOINC = '1986-9'",  # cpeptide
+           "LOINC = '4548-4' and TASK LIKE '%a1c%'", # a1c, LOINC alone will get a couple homocysteine results
+           "TASK LIKE '%gad%' or 
+                TASK LIKE '%decarboxylase%' or 
+                ORDERABLE LIKE '%decarboxylase%'or 
+                ORDERABLE LIKE '%gad%' or 
+                LOINC = '30347-9' or 
+                LOINC = '56540-8'") # gad
+
+for (w in where){
+  where_list <- list()
+  print(paste("Querying WHERE", str_replace_all(w, " \n               ", "")))
+  for (y in years){
+    print(paste("Retrieving", y, "records"))
+    where_list[[paste0("year_", y)]] <- dbGetQuery(conn, paste0("SELECT DE_ID, 
+                                                                  DE_ID_VISIT_NUMBER, 
+                                                                  LOINC,
+                                                                  EVENT_DATE_TIME,
+                                                                  ORDERABLE, 
+                                                                  TASK,
+                                                                  DISPLAYED_RESULT_VALUE, 
+                                                                  UNITS 
+                                                                FROM lab_orders_", y, 
+                                                                " WHERE ", w)) %>% as_tibble()
+  }                         
+  
+  lab[[w]] <- bind_rows(where_list)
+
+}
+
+lab_names = c("glucose", "insulin", "cpeptide", "a1c", "gad")
+names(lab) <- lab_names
+```
+
+Close SQL connection.
+
+```{r}
+dbDisconnect(conn)
+```
+
+# Data cleaning
+
+## Patient data
+Patient birthdays were converted into date format. Duplicates entries were removed.
+
+```{r}
+# format date
+patient <- patient %>% 
+  mutate(birth_date = date(mdy_hms(BIRTH_DATE))) %>%
+  select(-BIRTH_DATE)
+
+patient_cleaned <- patient %>%
+  distinct(DE_ID, birth_date, .keep_all = T) %>%
+  drop_na()
+
+```
+
+## BMI
+Pediatric BMI entries were removed. BMI values were recorded as strings in categories. TO calculate HOMA2 downsstream, BMI values were converted to numeric values using the lower bound of each string category.
+
+```{r}
+# remove pediatric bmi
+bmi_adult <- bmi %>% filter(!grepl("pediatric", .$CODE_DESCRIPTION, ignore.case = T))
+
+# extract bmi values from string
+bmi_adult <- bmi_adult %>% mutate(bmi_str = str_extract(tolower(.$CODE_DESCRIPTION), "\\d{2}\\.\\d{1}-\\d{2}\\.\\d{1}|\\d{2}\\-\\d{2}\\.\\d{1}|70|less"))
+
+# extract lower and upper limits of bmi range
+bmi_adult <- bmi_adult %>% mutate(lower = ifelse(bmi_str == "less", 19, str_replace(bmi_str, "-.*", "")),
+                                  upper = ifelse(bmi_str == "less", 19, str_replace(bmi_str, ".*-", "")))
+
+# convert string to numeric
+bmi_adult <- bmi_adult %>% mutate(lower = as.numeric(lower), upper = as.numeric(upper))
+
+# calculate interval
+bmi_adult <- bmi_adult %>% mutate(interval = upper - lower)
+
+# filter by interval
+bmi_filtered <- bmi_adult %>% filter((upper == 19 & interval == 0) | 
+                                    (lower >= 20 & upper < 40 & interval < 1) |
+                                    (lower >= 40 & upper < 50 & interval > 1 & interval < 5) |
+                                    (lower >= 50 & upper < 70 & interval > 5 & interval < 10) |
+                                    (lower >= 70 & interval == 0))
+
+# double check intervals
+bmi_intervals <-  bmi_filtered %>% 
+  arrange(lower) %>% 
+  select(lower, upper, interval) %>% 
+  group_by(interval) %>% 
+  summarise(lower_bound = min(lower), upper_bound = max(upper))
+print(bmi_intervals)
+
+# subset to cleaned tibble
+bmi_cleaned <- bmi_filtered %>% 
+  mutate(bmi = lower, bmi_date = date(mdy_hms(.$DIAG_DT_TM))) %>% 
+  select(DE_ID, DE_ID_VISIT_NUMBER, bmi_date, bmi) %>% 
+  group_by(DE_ID, bmi_date) %>% arrange(bmi) %>%
+  distinct(DE_ID, bmi_date, .keep_all = T) %>% ungroup() %>%
+  rename(bmi_visit_number = DE_ID_VISIT_NUMBER)
+```
+
+## Lab tests
+Source the cleaning functions `clean_lab` and `keep_first`.
+
+`clean_lab` cleans a dataframe extracted for the precision diabetes project by:
+
+1. converting dates and times to proper format, 
+2. imputing values above detection limit (as denoted by >) to limit + 0.1,
+3. imputing values below detection limit (as denoted by <) to limit - 0.1,
+4. checking if all units are identical,
+5. removing replicate tests by taking the median,
+6. removing negative values
+7. removing duplicate values
+
+`keep_first` finds and returns the first lab test of the day for each patients and discards the rest.
+
+```{r}
+source("/data/user/brianlu/projects/precision_diabetes/Clustering/functions_feature_cleaning.R")
+```
+
+### Glucose
+Glucose values needed to be matched with c-peptide or insulin values for HOMA2 estimation. Since the records did not indicate whether a glucose test was done at fasting or non-fasting, all glucose values were assumed to be non-fasting glucose. Glucose values were measured in mg/dL and were converted to mmol/L for HOMA2 estimation. Values below 3.5 mmol/L and above 25 mmol/L were removed. 
+
+```{r}
+glucose <- clean_lab(lab[["glucose"]], "glucose")
+
+# convert mg/dL to mmol/L and filter to HOMA2 range
+glucose_cleaned <- glucose %>% 
+  ungroup() %>% 
+  mutate(glucose = glucose / 18, # convert units to mmol/L
+         glucose_units = "mmol/L") %>% # update units
+  filter(glucose >= 3.5 & glucose <= 25)
+
+```
+
+### Insulin
+Insulin values needed to be matched with glucose for HOMA2 estimation. Insulin was measured in uIU/mL and converted to pmol/L. The conversion rate of 6 pmol/L = 1 uIU/mL was described by [Knopp et al.](https://journals.sagepub.com/doi/10.1177/1932296818805074). Values below 20 pmol/L and above 400 pmol/L were removed.
+
+```{r}
+insulin <- clean_lab(lab[["insulin"]], "insulin")
+
+# convert from microIU/mL to pmol/L and filter to HOMA2 range
+insulin_cleaned <- insulin %>% 
+  ungroup() %>% 
+  mutate(insulin = insulin * 6, # convert to pmol/L
+         insulin_units = "pmol/L") %>% # update units
+  filter(insulin >= 20 & insulin <= 400)
+```
+
+### C-peptide
+C-peptided values needed to be matched with glucose for HOMA2 estimation. C-peptide was measured in ng/mL and converted to nmol/L. The molecular weight of c-peptide (3020.29 g/mol) was used to calculate the conversion rate from ng/mL to nmol/L. Values below 0.2 nmol/L and above 3.5 nmol/L were removed. 
+
+```{r}
+cpeptide <- clean_lab(lab[["cpeptide"]], "cpeptide")
+
+
+# convert ng/mL to nmol/L
+cpeptide_conversion <- 1*10^-9 * 1000 / 3020.29 * 1*10^9
+cpeptide_cleaned <- cpeptide %>% 
+  ungroup() %>% 
+  mutate(cpeptide = cpeptide * cpeptide_conversion, # convert units
+         cpeptide_units = "nmol/L") %>% # update units
+  filter(cpeptide >= 0.2 & cpeptide <= 3.5)
+```
+
+### Hemoglobin A1c
+Hemoglobin A1c was measured in percent. 
+
+```{r}
+
+a1c <- clean_lab(lab[["a1c"]], "a1c")
+a1c_cleaned <- keep_first(a1c)
+
+```
+
+### Glutamic acid decarboxylase (GAD) auto-antibody
+CSF GAD tests were removed. GAD was measured in U/mL and nmol/L. A threshold of 5 U/mL or 0.02 nmol/L was used as the positive test threshold for GAD. If a patient tested positive for GAD auto-antibodies at any time, the patient was considered positive for GAD auto-antibodies. 
+
+```{r}
+# remove CSF values
+lab[["gad"]] <- lab[["gad"]] %>% 
+  filter(!grepl("CSF", .$TASK, ignore.case = T)) %>%
+  filter(!grepl("CSF", .$ORDERABLE, ignore.case = T))
+
+gad <- clean_lab(lab[["gad"]], "gad")
+
+# calculate gad positive by threshold
+gad$gad <- ifelse((gad$gad_units == "IntUnits/mL" | gad$gad_units == "unit(s)/mL" | gad$gad_units == "units/mL-Historical") & 
+                        gad$gad >= 5, 1, 
+                           ifelse(gad$gad_units == "nMol/L" & gad$gad >= 0.02, 1, 0))
+
+# some visits have multiple gad tests with different units at different times. Assume if positive at any point, positive
+gad_pos <- gad %>% 
+  group_by(DE_ID) %>% 
+  arrange(gad_date_time, .by_group = T) %>% 
+  distinct(DE_ID, gad, .keep_all = T)
+gad_pos <- gad_pos %>% 
+  group_by(DE_ID) %>% 
+  filter(gad == max(gad))
+
+gad_cleaned <- gad_pos %>% 
+  ungroup() %>% 
+  mutate(gad_date = date(gad_date_time)) %>% 
+  select(DE_ID, gad_visit_number, gad_date, gad) %>% 
+  distinct()
+```
+
+## Join data
+C-peptide and insulin must be matched measured with glucose at the same time for HOMA2 calculations. 
+
+```{r}
+# join for birthday
+birthdays <- patient_cleaned
+
+# join glucose and c-peptide
+homa_cpeptide <- inner_join(cpeptide_cleaned, glucose_cleaned, 
+                            by = c("DE_ID" = "DE_ID", 
+                                   "cpeptide_visit_number" = "glucose_visit_number", 
+                                   "cpeptide_date_time" = "glucose_date_time"))  %>%
+  mutate(homa_cpeptide_date = date(cpeptide_date_time)) %>% 
+  group_by(DE_ID) %>% 
+  arrange(cpeptide_date_time) %>% 
+  distinct(DE_ID, cpeptide_visit_number, .keep_all = T) %>% 
+  select(-cpeptide_date_time) %>%
+  rename(homa_cpeptide_visit_number = cpeptide_visit_number)
+
+# join glucose and insulin
+homa_insulin <- inner_join(insulin_cleaned, glucose_cleaned, 
+                           by = c("DE_ID" = "DE_ID", 
+                                  "insulin_visit_number" = "glucose_visit_number", 
+                                  "insulin_date_time" = "glucose_date_time")) %>% 
+  mutate(homa_insulin_date = date(insulin_date_time)) %>% 
+  group_by(DE_ID) %>% 
+  arrange(insulin_date_time) %>% 
+  distinct(DE_ID, insulin_visit_number, .keep_all = T) %>% 
+  select(-insulin_date_time) %>% 
+  rename(homa_visit_number = insulin_visit_number)
+```
+
+
+# Export results
+HOMA2 will be estimated separately using the Excel implementation of the [HOMA2 Calculator](https://www.rdm.ox.ac.uk/about/our-clinical-facilities-and-mrc-units/DTU/software/homa) (v2.2.3) from the University of Oxford.
+
+```{r}
+# create export directory if doesn't exist
+export_dir <- "/data/user/brianlu/projects/precision_diabetes/COVID19_clusters/exports"
+export_dir <- file.path(export_dir, paste0("features_Ahlqvist_", Sys.Date()))
+if (!dir.exists(export_dir)) {
+  dir.create(export_dir, recursive = T)
+}
+
+# export
+
+## patient characteristics
+write_csv(birthdays, file.path(export_dir, "birthdays.csv"))
+write_csv(bmi_cleaned, file.path(export_dir, "bmi.csv"))
+
+## lab results
+write_csv(glucose_cleaned, file.path(export_dir, "glucose.csv"))
+write_csv(cpeptide_cleaned, file.path(export_dir, "cpeptide.csv"))
+write_csv(insulin_cleaned, file.path(export_dir, "insulin.csv"))
+write_csv(a1c_cleaned, file.path(export_dir, "a1c.csv"))
+write_csv(gad_cleaned, file.path(export_dir, "gad.csv"))
+
+## for HOMA2 calculation
+write_csv(homa_cpeptide, file.path(export_dir, "homa_cpeptide.csv"))
+write_csv(homa_insulin, file.path(export_dir, "homa_insulin.csv"))
+```
+
+# Session information
+
+```{r}
+sessionInfo()
+```
+

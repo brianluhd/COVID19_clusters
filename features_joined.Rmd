@@ -1,0 +1,173 @@
+---
+title: "features_joined"
+author: "Brian Lu"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+    df_print: paged
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Overview
+Although diabetes is broadly classified as type 1 and type 2 diabetes, type 2 diabetes is known to be heterogeneous. Finer classifications of diabetes could aid in the personalization of diabetes treatment. [Ahlqvist et al.](https://doi.org/10.1016/s2213-8587(18)30051-2) recently identified 5 subtypes of diabetes with different risks of diabetic complications using glutamate decarboxylase antibody status, age at diagnoses, body mass index, HbA1c, and homeostatic model assessment 2 estimates of beta-cell function and insulin resistance. 
+
+**Objective:** Join all cleaned records from the UAB Health Systems to feed into clustering algorithms downstream.
+
+# Environment set up
+```{r}
+library(tidyverse)
+```
+
+# Import files
+Identify CSV files containing cleaned records from the UAB Health Systems.
+
+```{r}
+# file path for diagnoses and encounters
+diagnoses_path <- "/data/user/brianlu/projects/precision_diabetes/COVID19_clusters/exports/features_diagnoses_2024-07-08/features_diagnoses.csv"
+
+# file paths for features used by Ahlqvist et al.
+ahlqvist_dir_path <- "/data/user/brianlu/projects/precision_diabetes/COVID19_clusters/exports/features_Ahlqvist_2024-06-28"
+ahlqvist_files <- list.files(ahlqvist_dir_path)
+
+## remove export file used to compute homa
+remove_index <- grep("homa_cpeptide\\.csv|homa_insulin\\.csv", ahlqvist_files)
+ahlqvist_files <- ahlqvist_files[-remove_index]
+
+# file paths for additional features
+additional_dir_path <- "/data/user/brianlu/projects/precision_diabetes/COVID19_clusters/exports/features_additional_2024-06-28"
+additional_files <- list.files(additional_dir_path)
+
+```
+
+Import identified CSV files as a list.
+
+```{r}
+paths <- c(diagnoses_path,
+           file.path(ahlqvist_dir_path, ahlqvist_files),
+           file.path(additional_dir_path, additional_files))
+
+file_names <- c("diagnoses",
+                str_extract(ahlqvist_files, "(.*)\\.csv$", group = 1),
+                str_extract(additional_files, "(.*)\\.csv$", group = 1))
+
+file_names <- str_replace_all(file_names, "_calc", "")
+
+records <- lapply(paths, read_csv, show_col_types = F)
+names(records) <- file_names
+```
+
+# Clean data
+Change some columns names to make joining easier and correct formatting errors.
+
+```{r}
+# rename columns to distinguish original columns from joined columns
+records[["homa_cpeptide"]] <- records[["homa_cpeptide"]] %>% rename(homa_cpeptide_cpeptide = cpeptide,
+                                                                              homa_cpeptide_cpeptide_units = cpeptide_units,
+                                                                              homa_cpeptide_glucose  = glucose,
+                                                                              homa_cpeptide_glucose_units = glucose_units)
+
+# correct date formatting messed up by importing into Excel to calculate HOMA
+records[["homa_cpeptide"]] <- records[["homa_cpeptide"]] %>% mutate(homa_cpeptide_date = mdy(homa_cpeptide_date))
+
+# rename columns to distinguish original columns from joined columns
+records[["homa_insulin"]] <- records[["homa_insulin"]] %>% rename(homa_insulin_insulin = insulin,
+                                                                            homa_insulin_insulin_units = insulin_units,
+                                                                            homa_insulin_glucose  = glucose,
+                                                                            homa_insulin_glucose_units = glucose_units)
+
+# correct date formatting messed up by importing into Excel to calculate HOMA
+records[["homa_insulin"]] <- records[["homa_insulin"]] %>% mutate(homa_insulin_date = mdy(homa_insulin_date))
+
+# rename columns to match file name
+colnames(records[["triglyceride"]]) <- str_replace_all(colnames(records[["triglyceride"]]), "tg", "triglyceride")
+
+# rename columns in u_ketone positive to distinguish from u_ketone 
+colnames(records[["u_ketone_first_positive"]]) <- str_replace_all(colnames(records[["u_ketone_first_positive"]]), "u_ketone", "u_ketone_first_positive")
+
+# convert u_ketone_positive from date time to date only
+records[["u_ketone_first_positive"]] <- records[["u_ketone_first_positive"]] %>%
+  mutate(u_ketone_first_positive_date_time = date(u_ketone_first_positive_date_time)) %>%
+  rename(u_ketone_first_positive_date = u_ketone_first_positive_date_time)
+
+```
+
+Source the cleaning function `keep_first`. `keep_first` finds and returns the first lab test of the day for each patients and discards the rest.
+
+```{r}
+source("/data/user/brianlu/projects/precision_diabetes/Clustering/functions_feature_cleaning.R")
+```
+
+Find and keep the first glucose, insulin, and cpeptide test of the day for each patient.
+
+```{r}
+records[["glucose"]] <- keep_first(records[["glucose"]])
+records[["insulin"]] <- keep_first(records[["insulin"]])
+records[["cpeptide"]] <- keep_first(records[["cpeptide"]])
+```
+
+Calculate age at first diabetes diagnoses in the records for each patient.
+
+```{r}
+joined_records <- inner_join(records[["diagnoses"]], records[["birthdays"]], by = join_by(DE_ID)) %>%
+  mutate(diabetes_age = as.numeric(diabetes_date - birth_date, "days")/365)
+```
+
+# Join records
+Join demographic data to diagnoses and encounters.
+
+```{r}
+joined_records <- inner_join(records[["patient_demo"]], joined_records, by = join_by(DE_ID))
+```
+
+Left join all records on diagnoses. Only the test result closest to the initial diabetes diagnoses date for each patient was kept.
+
+```{r}
+# find index position of all test results
+index = seq(1, length(records))[-grep("diagnoses|birthdays|demo", names(records))]
+
+for (i in index){
+  # left join on diagnoses and birthdays
+  joined_records <- left_join(joined_records, records[[i]], by = join_by(DE_ID), relationship = "many-to-many")
+  
+  # calculate days to diagnoses and keep only nearest test results
+  test_name <- names(records)[i]
+  date_name <- paste(test_name, "date", sep = "_")
+  test_days <- paste(test_name, "diabetes_days", sep = "_")
+  joined_records <- mutate(.data = joined_records, "{test_days}" := as.numeric(.data[[date_name]] - diabetes_date, "days")) %>%
+    group_by(DE_ID) %>%
+    filter(abs(.data[[test_days]]) == min(abs(.data[[test_days]])) | 
+             is.na(.data[[test_days]])) %>% # keep the test with closest to the diagnoses date
+    filter(.data[[test_days]] == max(.data[[test_days]]) | 
+             is.na(.data[[test_days]])) %>% # if test is equal in days ahead and after the diagnoses date, keep the one after
+    distinct()
+    
+}
+
+```
+
+# Export results
+Export joined records as CSV file.
+
+```{r}
+# create export directory if doesn't exist
+export_dir <- "/data/user/brianlu/projects/precision_diabetes/COVID19_clusters/exports"
+export_dir <- file.path(export_dir, paste0("features_joined_", Sys.Date()))
+if (!dir.exists(export_dir)) {
+  dir.create(export_dir, recursive = T)
+}
+
+# export
+write_csv(joined_records, file.path(export_dir, "features_joined.csv"))
+```
+
+# Session information
+
+```{r}
+sessionInfo()
+```
