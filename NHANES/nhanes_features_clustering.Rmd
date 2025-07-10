@@ -1,0 +1,107 @@
+---
+title: "Feature extraction for NHANES respondents with medically diagnosed diabetes"
+author: "Brian Lu"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# NHANES clusters
+
+Use [NHANES](https://wwwn.cdc.gov/nchs/nhanes/default.aspx) data to generate diabetes subtype clusters representative of the US population.
+
+**Objective:** Extract required data from NHANES to generate diabetes clusters for participants.
+
+# Environment setup
+
+Load required libraries.
+
+```{r}
+library(tidyverse)
+```
+
+Set root directory
+
+```{r}
+here::i_am("README.md")
+```
+
+# Import data
+
+Import previously downloaded NHANES data from the 2015-2016, 2017-2020 pre-pandemic, and 08/2021-08/2023 NHANES cycles.
+
+```{r}
+
+export_dir <- here::here("exports", "NHANES")
+nhanes_data <- read_rds(here::here(export_dir, "nhanes_raw_data.rds"))
+
+```
+
+# Data cleaning
+
+Filter data to only adults with medically diagnosed diabetes or adults meeting diagnostic criteria for diabetes. Respondents with insulin or glucose values outside the HOMA calculation range were excluded. Respondents with missing values were excluded.
+
+```{r}
+clustering_features <- nhanes_data %>%
+  filter(RIDAGEYR >= 18) %>% # must be adult during survey
+  filter((DIQ010 == "Yes" & DID040 >= 18 & DID040 <= 80) | DIQ010 != "Yes") %>% # must be adults at time of diagnosis if diagnosed
+  # age above 80 coded as 80, values above 80 indicates unknown, less than 1 years old, or refused to answer
+  filter(DIQ010 == "Yes" | LBXGH >= 6.5 | LBDGLUSI >= 7) %>% # must be diagnosed diabetes or meet diagnostic criteria
+  filter(LBDINSI >= 20 & LBDINSI <= 400) %>% # filter insulin to HOMA range
+  filter(LBDGLUSI >= 3.5 & LBDGLUSI <= 25) %>% # filter glucose to HOMA range
+  select(SEQN, cycle, RIDRETH1, RIAGENDR, DIQ010, LBXGH, BMXBMI, RIDAGEYR, LBDINSI, LBDGLUSI) %>% # select cycle and required clustering features
+  drop_na() # drop rows with missing values
+
+```
+
+Calculate insulinn HOMA estimates and convert to c-peptide equivalents.
+
+```{r}
+
+# import HOMA regression models
+homa1b_model <- readRDS(here::here("exports/HOMA_regression/homa1b_model.RDS"))
+homa1ir_model <- readRDS(here::here("exports/HOMA_regression/homa1ir_model.RDS"))
+
+# calculate HOMA estimates
+homa1 <- clustering_features %>%
+  mutate(insulin_homa1b = (20 * LBDINSI/6) / (LBDGLUSI - 3.5),
+         insulin_homa1ir = (LBDGLUSI * LBDINSI/6) / 22.5)
+
+# rename columns to match regression model
+homa1 <- homa1 %>%
+  mutate(race = relevel(factor(case_when(RIDRETH1 == "Mexican American" ~ "Hispanic or Latino",
+                          RIDRETH1 == "Other Hispanic" ~ "Hispanic or Latino",
+                          .default = RIDRETH1)), ref = "Non-Hispanic White")) %>%
+  rename(gender = RIAGENDR)
+
+# re.form = NA to specify no random effects
+homa1 <- homa1 %>%
+  mutate(homa1_cpeptide_b = exp(predict(homa1b_model, newdata = homa1, re.form = NA)), 
+         homa1_cpeptide_ir = exp(predict(homa1ir_model, newdata = homa1, re.form = NA)))
+
+clustering_features <- clustering_features %>%
+  mutate(homa1_cpeptide_b = homa1$homa1_cpeptide_b,
+         homa1_cpeptide_ir = homa1$homa1_cpeptide_ir) %>% 
+  select(-RIDRETH1, -RIAGENDR)
+  
+```
+
+# Export data
+
+Export the resulting data for clustering.
+
+```{r}
+# export for HOMA calculation
+write_csv(clustering_features, file.path(export_dir, "nhanes_clustering_features.csv"))
+
+```
+
+# Session information
+
+```{r}
+sessionInfo()
+```
+

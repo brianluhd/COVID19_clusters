@@ -1,0 +1,212 @@
+---
+title: "Data extraction for NHANES"
+author: "Brian Lu"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Environment setup
+
+Import libraries
+
+```{r}
+library(tidyverse)
+library(nhanesA)
+```
+
+Set root directory
+
+```{r}
+here::i_am("README.md")
+```
+
+# Import data
+
+NHANES data was imported using [nhanesA](https://doi.org/10.1093/database/baae028). Imported demographic and diabetes questionnaires, glycohemoglobin (HbA1c), insulin, and plasma fasting glucose laboratory data, and body measure examinations (BMI) data from the 2015-2016, 2017-2020 pre-pandemic, and 08/2021-08/2023 NHANES cycles. The 2009-2010, 2010-2012, and 2013-2014 cycles were not used since they had different methodologies for insulin (2009-2010 and 2010-2012 cycles) and glucose (2009-2010, 2010-2012, and 2013-2014 cycles).
+
+```{r}
+table_names <- c("DEMO", "DIQ", "GHB", "BMX", "INS", "GLU") # for survey age, diabetes diagnosis age, a1c, bmi, insulin, and glucose
+
+table_names <- append(table_names, c("HIQ", # health insurance
+                                     "RXQ_RX")) # prescriptions
+                                    
+
+table_suffixes <- c("I", "L") # for 2015-2016, and 2021-2023
+
+table_codes <- map(table_names, paste, table_suffixes, sep = "_")
+names(table_codes) <- table_names
+
+nhanes_tables <- list()
+
+for (s in table_suffixes){
+  nhanes_tables[[s]] <- list()
+  
+  table_codes <- purrr::map_vec(table_names, paste, s, sep = "_")
+  
+  nhanes_tables[[s]] <- map(table_codes, nhanes) %>% # table INS_G will give download length error since INS is in GLU that year
+    map(., as_tibble)
+  
+  names(nhanes_tables[[s]]) <- table_names
+}
+
+# pre-pandemic data has prefix instead of suffix, extract separately
+p <- map(paste("P", table_names, sep = "_"), nhanes) %>% map(., as_tibble)
+names(p) <- table_names
+
+nhanes_tables[["P"]] <- p
+
+# import prescripiton codes
+codebook_url <- "https://wwwn.cdc.gov/Nchs/Data/Nhanes/Public/1988/DataFiles/RXQ_DRUG.xpt"
+temp_file <- tempfile()
+download.file(codebook_url, temp_file, mode = "wb", quiet = TRUE)
+prescription_codebook <- foreign::read.xport(temp_file) %>% as_tibble()
+unlink(temp_file)
+```
+
+# Data cleaning
+
+Merge additional data from NHANES. 
+
+```{r message=FALSE, warning=FALSE}
+
+prescription_class <- function(df, prescription_codebook, prescription_category2){
+  
+  # fill in blank as unspecified
+  codebook <- prescription_codebook %>% 
+    mutate(RXDDCN1C = case_when(RXDDCN1C == "" ~ "UNSPECIFIED", .default = RXDDCN1C)) # label unspecified prescriptions if first in category
+  
+  # extract SEQN to merge
+  df_summarized <- df %>% distinct(SEQN)
+  
+  # match prescription to each level 3 category
+  codebook_level3 <- codebook %>%
+    select(RXDDRGID, 
+           RXDDCN1C, RXDDCN2C, RXDDCN3C)
+  df <- df %>% 
+    left_join(codebook_level3, by = join_by(RXDDRGID))
+  
+  # loop for each level2 category
+  for (cat2 in prescription_category2){
+
+    # find all unique first level 3 categories under defined level 2 category
+    cat3 <- codebook %>% 
+      filter(RXDDCN1B == cat2) %>% 
+      distinct(RXDDCN1C) %>% 
+      arrange(desc(RXDDCN1C)) %>%
+      pull(RXDDCN1C)
+    
+
+    # tidy category names
+    tidy_cat2 <- str_replace_all(tolower(cat2), " |-|\\(|\\)", "_")
+    
+    df_summarized <- df_summarized %>% 
+      mutate("{tidy_cat2}" := "No")
+    
+    # label each prescription to individual level 3 categories under level 2 category
+    for (category in cat3){
+      # construct tidy column name
+      tidy_category <- str_replace_all(tolower(category), " |-|\\(|\\)", "_")
+      
+      # append level 2 name to unspecified
+      tidy_category <- if_else(tidy_category == "unspecified", paste(tidy_category, tidy_cat2, sep = "_"), tidy_category)
+      
+      df_summarized <- df %>%
+        group_by(SEQN) %>%
+        # detect level 3 category in any prescription levels
+        summarise("{tidy_category}" := as.integer(any(str_detect(RXDDCN1C, category), 
+                                                      str_detect(RXDDCN2C, category),
+                                                      str_detect(RXDDCN3C, category)))) %>% 
+        mutate("{tidy_category}" := case_when(!!sym(tidy_category) == 1 ~ "Yes", .default = "No")) %>%
+                 #replace_na(!!sym(tidy_category), 0)) %>% # replace NA from no prescription with 0
+        right_join(df_summarized, by = join_by(SEQN))
+      
+      # change level2 category to positive if any in level3 category is detected
+      df_summarized <- df_summarized %>%
+        mutate("{tidy_cat2}" := case_when(!!sym(tidy_category) == "Yes" ~ "Yes", .default = !!sym(tidy_cat2)))
+      
+    }
+    
+  }
+
+  return(df_summarized)
+  
+}
+
+
+# fix colnames to match
+# nhanes_tables$I$BPXO <- nhanes_tables$I$BPXO %>%
+#   rename_with(., ~stringr::str_replace(.x, "BPX", "BPXO"))
+
+cycle_tables <- list()
+for (s in c(table_suffixes, "P")){
+  cycle_tables[[s]] <- nhanes_tables[[s]]$DEMO %>% mutate(cycle = s)
+  
+  for (t in table_names[table_names != "DEMO"]){
+    
+    if (t == "RXQ_RX" & s != "L"){ # no prescription details in cycle L
+      nhanes_tables[[s]][[t]] <- prescription_class(nhanes_tables[[s]][[t]], 
+                                                    prescription_codebook, 
+                                                    c("ANTIHYPERTENSIVE COMBINATIONS", "ANTIDIABETIC AGENTS"))
+        
+        # nhanes_tables[[s]][[t]] %>%
+        # group_by(SEQN) %>%
+        # summarise(insulin = sum(str_detect(RXDDRUG, "INSULIN")),
+        #           verapamil = sum(str_detect(RXDDRUG, "VERAPAMIL"))) %>%
+        # mutate(insulin = case_when(insulin > 0 ~ 1, .default = 0),
+        #        verapamil = case_when(verapamil > 0 ~ 1, .default = 0))
+    }
+    
+    cycle_tables[[s]] <- cycle_tables[[s]] %>% 
+      full_join(nhanes_tables[[s]][[t]]) %>% select(-one_of("WTPH2YR")) # remove phebotomy weight, causes duplication issues
+    
+    
+    
+  }
+  
+  # if (s %in% table_suffixes){
+  #   cycle_tables[[s]] <- cycle_tables[[s]] %>%
+  #     rename(diet_weight = WTDRD1) # diet weight, derived from subset of fasting MEC weight
+  #      
+  # }
+  # 
+  # if (s == "P"){
+  #   cycle_tables[[s]] <- cycle_tables[[s]] %>%
+  #     rename(diet_weight = WTDRD1PP) # diet weight, derived from subset of fasting MEC weight
+  # }
+  
+}
+  
+# convert factor to numeric to match formatting
+cycle_tables$I <- cycle_tables$I %>%
+  mutate(DMDHHSIZ = as.numeric(str_extract(DMDHHSIZ, "\\d+")))
+
+merged_nhanes <- bind_rows(cycle_tables)
+```
+
+# Export data
+
+Export data for downstream analysis.
+
+```{r}
+
+export_dir <- here::here("exports/NHANES")
+
+if (!dir.exists(export_dir)) {
+  dir.create(export_dir, recursive = T)
+}
+
+saveRDS(merged_nhanes, file.path(export_dir, "nhanes_raw_data.rds"))
+
+```
+
+# Session information
+
+```{r}
+
+sessionInfo()
+
+```

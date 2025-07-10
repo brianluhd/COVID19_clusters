@@ -1,0 +1,557 @@
+---
+title: "HOMA1 regression"
+author: "Brian Lu"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+    df_print: paged
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Overview
+HOMA1 estimates calculated with insulin and c-peptide may results in differences. 
+
+**Objective:** Use linear regression to convert between c-peptide HOMA1 estimates and insulin HOMA1 estimates.
+
+# Environment set up
+
+```{r}
+library(tidyverse)
+library(nhanesA)
+
+library(gridExtra)
+
+library(lme4)
+library(lmerTest)
+library(MuMIn)
+
+set.seed(42)
+```
+
+Set root directory
+
+```{r}
+here::i_am("README.md")
+```
+
+# Data cleaning
+
+## UAB data
+
+Import all available records for calculating HOMA1 estimates between 2010-2019.
+
+```{r}
+
+import_dir <- "/data/user/brianlu/projects/precision_diabetes/Clustering/exports/features_Ahlqvist_2024-02-05"
+glucose2010 <- read_csv(file.path(import_dir, "glucose.csv"), show_col_types = F)
+cpeptide2010 <- read_csv(file.path(import_dir, "cpeptide.csv"), show_col_types = F)
+insulin2010 <- read_csv(file.path(import_dir, "insulin.csv"), show_col_types = F)
+birthday2010 <- read_csv(file.path(import_dir, "birthdays.csv"), show_col_types = F)
+
+demo_dir <- "/data/user/brianlu/projects/precision_diabetes/Clustering/exports/features_additional_2024-02-05"
+demo2010 <- read_csv(file.path(demo_dir, "patient_demo.csv"), show_col_types = F)
+```
+
+Filter data to only records containing glucose, insulin and c-peptide values measured at the same time.
+
+```{r}
+data2010 <- glucose2010 %>%
+  inner_join(cpeptide2010, by = c("DE_ID" = "DE_ID",
+                              "glucose_visit_number" = "cpeptide_visit_number", 
+                              "glucose_date_time" = "cpeptide_date_time")) %>%
+  inner_join(insulin2010, by = c("DE_ID" = "DE_ID",
+                              "glucose_visit_number" = "insulin_visit_number", 
+                              "glucose_date_time" = "insulin_date_time")) %>%
+  inner_join(birthday2010, by = join_by(DE_ID)) %>%
+  inner_join(demo2010, by = join_by(DE_ID))
+  
+```
+
+Import all available records for calculating HOMA1 estimates between 2020-2024.
+
+```{r}
+
+import_dir <- here::here("exports/UAB/raw")
+glucose2020 <- read_csv(file.path(import_dir, "glucose.csv"), show_col_types = F)
+cpeptide2020 <- read_csv(file.path(import_dir, "cpeptide.csv"), show_col_types = F)
+insulin2020 <- read_csv(file.path(import_dir, "insulin.csv"), show_col_types = F)
+birthday2020 <- read_csv(file.path(import_dir, "birthdays.csv"), show_col_types = F)
+demo2020 <- read_csv(file.path(import_dir, "patient_demo.csv"), show_col_types = F)
+```
+
+Filter data to only records containing glucose, insulin and c-peptide values measured at the same time.
+
+```{r}
+data2020 <- glucose2020 %>%
+  inner_join(cpeptide2020, by = c("DE_ID" = "DE_ID",
+                              "glucose_visit_number" = "cpeptide_visit_number", 
+                              "glucose_date_time" = "cpeptide_date_time")) %>%
+  inner_join(insulin2020, by = c("DE_ID" = "DE_ID",
+                              "glucose_visit_number" = "insulin_visit_number", 
+                              "glucose_date_time" = "insulin_date_time")) %>%
+  inner_join(birthday2020, by = join_by(DE_ID)) %>%
+  inner_join(demo2010, by = join_by(DE_ID))
+```
+
+Combine data and calculate HOMA1 estimates from both insulin and c-peptide. Records with glucose values less than or equal to 3.5 mM were excluded since they result in negative or infinity HOMA1-B values.
+
+```{r}
+
+data_uab <- data2010 %>%
+  bind_rows(data2020)
+
+data_uab <- data_uab %>% 
+  # filter to HOMA range
+  filter(glucose > 3.5 & glucose <= 25 &
+           cpeptide >= 0.2 & cpeptide <= 3.5 & 
+           insulin >= 20 & insulin <= 400) %>%
+  mutate(cpeptide_homa1b = (20 * 6 * cpeptide) / (glucose - 3.5),
+         cpeptide_homa1ir = (glucose * 6 * cpeptide) / 22.5,
+         insulin_homa1b = (20 * insulin/6) / (glucose - 3.5),
+         insulin_homa1ir = (glucose * insulin/6) / 22.5,
+         source = "uab", # label data source
+         age = as.numeric(date(glucose_date_time) - birth_date)/365) %>%
+  filter(age >= 18) # keep only adults
+
+```
+
+Unify demographic features with NHANES.
+
+```{r}
+data_uab <- data_uab %>%
+  mutate(race = relevel(factor(case_when(race == "White" ~ "Non-Hispanic White",
+                                         race == "Black or African American" ~ "Non-Hispanic Black",
+                                         race == "Hispanic or Latino" ~ "Hispanic or Latino",
+                                         .default = "Other Race - Including Multi-Racial")), ref = "Non-Hispanic White"),
+         gender = case_when(gender == "F" ~ "Female",
+                            gender == "M" ~ "Male"))
+```
+
+## NHANES
+
+Import insulin, c-peptide, and glucose data. Due to instrument changes between 1999-2002 and 2003-2004 from the Pharmacia to the Tosoh, insulin values from 2003-2004 were regressed backwards to match the 1999-2002 values.
+
+```{r}
+nhanes1999 <- nhanes("LAB10AM") %>% as_tibble()
+nhanes2001 <- nhanes("L10AM_B") %>% as_tibble()
+nhanes2001_2 <- nhanes("L10_2_B") %>% as_tibble() %>%
+  rename(LBXGLUSI = LB2GLUSI,
+         LBXCPSI = LB2CPSI,
+         LBXINSI = LB2INSI)
+nhanes2003 <- nhanes("L10AM_C") %>% as_tibble() %>%
+  rename(LBXGLUSI = LBDGLUSI) %>%
+  mutate(LBXINSI =  (0.96006 * LBXIN + 3.23663) * 6) # regress backwards and convert to SI units
+
+nhanes_data <- bind_rows(list(nhanes1999, nhanes2001, nhanes2001_2, nhanes2003)) %>%
+  # filter to HOMA range
+  filter(LBXGLUSI > 3.5 & LBXGLUSI <= 25 &
+           LBXCPSI >= 0.2 & LBXCPSI <= 3.5 & 
+           LBXINSI >= 20 & LBXINSI <= 400) %>% 
+  mutate(glucose = LBXGLUSI,
+         cpeptide_homa1b = (20 * 6 * LBXCPSI) / (LBXGLUSI - 3.5),
+         cpeptide_homa1ir = (LBXGLUSI * 6 * LBXCPSI) / 22.5,
+         insulin_homa1b = (20 * LBXINSI/6) / (LBXGLUSI - 3.5),
+         insulin_homa1ir = (LBXGLUSI * LBXINSI/6) / 22.5,
+         source = "nhanes") %>% # label data source
+  select(SEQN, glucose, cpeptide_homa1b, cpeptide_homa1ir, insulin_homa1b, insulin_homa1ir, source) %>%
+  drop_na()
+```
+
+Import demographic data for participants' ages and insulin use status.
+
+```{r}
+table_names <- c("DEMO", "DIQ") # for survey age , sex, race, and insulin status
+
+table_suffixes <- c("nosuffix", "B", "C") # for 1999-2000, 2001-2002, 2003-2004
+
+nhanes_tables <- list()
+
+for (s in table_suffixes){
+  nhanes_tables[[s]] <- list()
+  
+  table_codes <- purrr::map_vec(table_names, paste, s, sep = "_")
+  table_codes <- map(table_codes, ~str_remove(string = .x, pattern = "_nosuffix$"))
+  
+  nhanes_tables[[s]] <- map(table_codes, nhanes) %>% 
+    map(., as_tibble)
+  
+  names(nhanes_tables[[s]]) <- table_names
+}
+```
+
+Merge demographic data across cycles.
+
+```{r}
+cycle_tables <- list()
+
+for (s in table_suffixes){
+  cycle_tables[[s]] <- nhanes_tables[[s]]$DEMO %>% mutate(cycle = s)
+  
+  for (t in table_names[table_names != "DEMO"]){
+    
+    cycle_tables[[s]] <- cycle_tables[[s]] %>% 
+      full_join(nhanes_tables[[s]][[t]]) #%>% select(-one_of("WTPH2YR")) # remove phebotomy weight, causes duplication issues
+  }
+}
+
+merged_nhanes <- bind_rows(cycle_tables)
+```
+
+Join demographic data with HOMA data.
+
+```{r}
+nhanes_data <- nhanes_data %>% inner_join(merged_nhanes, by = join_by(SEQN)) %>%
+  rename(DE_ID = SEQN) # rename ID to match UAB data
+```
+
+Unify demographic features with NHANES.
+
+```{r}
+nhanes_data <- nhanes_data %>%
+  mutate(race = relevel(factor(case_when(RIDRETH1 == "Mexican American" ~ "Hispanic or Latino",
+                          RIDRETH1 == "Other Hispanic" ~ "Hispanic or Latino",
+                          .default = RIDRETH1)), ref = "Non-Hispanic White")) %>%
+  rename(gender = RIAGENDR)
+```
+
+Remove NHANES participants under 18 and remove participants currently using insulin.
+
+```{r}
+nhanes_data <- nhanes_data %>% filter(RIDAGEYR >= 18) %>% filter(DIQ050 != "Yes")
+```
+
+## Combine data
+
+```{r}
+data <- bind_rows(list(data_uab, nhanes_data))
+```
+
+Combined data contains 3003 HOMA estimates pairs from 2720 UAB patients and 6510 HOMA estimate pairs from 6331 NHANES participants.
+
+Set some data aside for testing.
+
+```{r}
+
+test_data <- data %>% slice_sample(prop = 0.2, replace = F)
+
+data <- data %>% anti_join(test_data, by = join_by(DE_ID))
+
+```
+
+Training data contains 2229 HOMA estimate pairs from 2112 UAB patients and 5175 HOMA estimate pairs from 5060 NHANES partipants. 
+Test data contains 626 HOMA estimate pairs from 608 UAB patients and 1276 HOMA estimate pairs from 1271 NHANES participants.
+
+# Linear regression
+
+HOMA1 estimate values appear approximately log-normal and linearly correlated after log-transformation. UAB data seems to contain lower HOMA1-B and higher HOMA1-IR values, likely since UAB data contains only patients with diabetes while most NHANES participants do not have diabetes.
+
+```{r}
+
+grid.arrange(# HOMA-B
+             ggplot(data, mapping = aes(x = cpeptide_homa1b)) + geom_histogram(),
+             ggplot(data, mapping = aes(x = log(cpeptide_homa1b))) + geom_histogram(),
+             ggplot(data, mapping = aes(x = insulin_homa1b)) + geom_histogram(),
+             ggplot(data, mapping = aes(x = log(insulin_homa1b))) + geom_histogram(),
+             # HOMA-IR
+             ggplot(data, mapping = aes(x = cpeptide_homa1ir)) + geom_histogram(),
+             ggplot(data, mapping = aes(x = log(cpeptide_homa1ir))) + geom_histogram(),
+             ggplot(data, mapping = aes(x = insulin_homa1ir)) + geom_histogram(),
+             ggplot(data, mapping = aes(x = log(insulin_homa1ir))) + geom_histogram(),
+             # correlation
+             ggplot(data, mapping = aes(x = log(insulin_homa1b), y = log(cpeptide_homa1b), color = source)) +
+               geom_smooth(method = "lm") + geom_density_2d(),
+             ggplot(data, mapping = aes(x = log(insulin_homa1ir), y = log(cpeptide_homa1ir), color = source)) + 
+               geom_smooth(method = "lm") + geom_density_2d(),
+             ncol = 2)
+```
+
+Confirmation linear correlation.
+
+```{r}
+cor.test(log(data$insulin_homa1b), log(data$cpeptide_homa1b))
+cor.test(log(data$insulin_homa1ir), log(data$cpeptide_homa1ir))
+```
+
+
+## HOMA1-B regression
+
+Build linear regression model using log-transformed HOMA1 values. Since some patients have more than 1 value, DE_ID was included as a random effect to account for the nested structure of the data. 
+
+```{r}
+homa1b_model <- lmer(log(cpeptide_homa1b) ~ log(insulin_homa1b) + race + gender + (1|DE_ID), data)
+
+homa1b_summary <- summary(homa1b_model)
+
+print(homa1b_summary)
+
+print(r.squaredGLMM(homa1b_model))
+
+print(homa1b_summary$coefficients)
+```
+
+Inspect regression.
+
+```{r}
+plot(homa1b_model)
+```
+
+## HOMA1-IR regression
+
+Build linear regression model using log-transformed HOMA1 values. DE_ID were included as factors so that regression won't be weighed towards patients with multiple HOMA1 estimate values. 
+
+```{r}
+homa1ir_model <- lmer(log(cpeptide_homa1ir) ~ log(insulin_homa1ir) + race + gender + (1|DE_ID), data)
+
+homa1ir_summary <- summary(homa1ir_model)
+
+print(homa1ir_summary)
+
+print(r.squaredGLMM(homa1ir_model))
+
+print(homa1ir_summary$coefficients)
+```
+
+Inspect regression.
+
+```{r}
+plot(homa1ir_model)
+```
+
+# Inspect model
+
+Calculate predicted estimate values from linear regression. Random effects were ignored since we only want a general conversion for a "population average".
+
+```{r}
+data <- data %>%
+  mutate(homa1b_pred = exp(predict(homa1b_model, newdata = data, re.form = NA)), # re.form = NA to specify no random effects
+         homa1ir_pred = exp(predict(homa1ir_model, newdata = data, re.form = NA)))
+```
+
+Compare mean absolute error.
+
+```{r}
+
+# calculate absolute difference
+data <- data %>% 
+  mutate(homa1b_ad = abs(cpeptide_homa1b - insulin_homa1b),
+         homa1ir_ad = abs(cpeptide_homa1ir - insulin_homa1ir),
+         homa1b_fit_ad = abs(cpeptide_homa1b - homa1b_pred),
+         homa1ir_fit_ad = abs(cpeptide_homa1ir - homa1ir_pred))
+
+abdif_list <- list("homa1b_ab_dif" = summary(data$homa1b_ad) %>% as.list() %>% as_tibble(),
+                   "homa1ir_ab_dif" = summary(data$homa1ir_ad) %>% as.list() %>% as_tibble(),
+                   "homa1b_fitted_ab_dif" = summary(data$homa1b_fit_ad) %>% as.list() %>% as_tibble(),
+                   "homa1ir_fitted_ab_dif" = summary(data$homa1ir_fit_ad) %>% as.list() %>% as_tibble())
+
+
+abdif_summary <- bind_rows(abdif_list) %>%
+  mutate(model = names(abdif_list),
+         pairedTTest = c(NA, NA, 
+                         t.test(data$homa1b_fit_ad, data$homa1b_ad, paired = T)$p.value,
+                         t.test(data$homa1ir_fit_ad, data$homa1ir_ad, paired = T)$p.value)) %>%
+  relocate(model)
+
+```
+
+Regression does appear to shift insulin HOMA1 estimate values closer to c-peptide HOMA1 estimate values.
+
+```{r}
+# graphing parameters
+base_size <- 7
+size = 0.1
+
+b_cpeptide_insulin <- ggplot(data, mapping = aes(x = log(cpeptide_homa1b), y = log(insulin_homa1b))) + 
+  theme_classic(base_size = base_size) +
+  geom_point(size = size) + 
+  geom_density_2d() + 
+  geom_abline(intercept = 0, slope = 1, color = "red") + 
+  labs(x = expression(ln("HOMA1-B"["c-peptide"])), 
+       y = expression(ln("HOMA1-B"["insulin"])),
+       color = "Data source") + 
+  theme(plot.margin = margin(t = 6))
+
+b_cpeptide_fitted <- ggplot(data, mapping = aes(x = log(cpeptide_homa1b), y = log(homa1b_pred))) + 
+  theme_classic(base_size = base_size) +
+  geom_point(size = size) + 
+  geom_density_2d() + 
+  geom_abline(intercept = 0, slope = 1, color = "red") + 
+  labs(x = expression(ln("HOMA1-B"["c-peptide"])), 
+       y = expression(ln("Scaled HOMA1-B"["insulin"]))) + 
+  theme(plot.margin = margin(t = 6))
+
+ir_cpeptide_insulin <- ggplot(data, mapping = aes(x = log(cpeptide_homa1ir), y = log(insulin_homa1ir))) + 
+  theme_classic(base_size = base_size) +
+  geom_point(size = size) + 
+  geom_density_2d() +
+  geom_abline(intercept = 0, slope = 1, color = "red") + 
+  labs(x = expression(ln("HOMA1-IR"["c-peptide"])), 
+       y = expression(ln("HOMA1-IR"["insulin"]))) + 
+  theme(plot.margin = margin(t = 6)) 
+
+ir_cpeptide_fitted <- ggplot(data, mapping = aes(x = log(cpeptide_homa1ir), y = log(homa1ir_pred))) + 
+  theme_classic(base_size = base_size) +
+  geom_point(size = size) + 
+  geom_density_2d() +
+  geom_abline(intercept = 0, slope = 1, color = "red") + 
+  labs(x = expression(ln("HOMA1-IR"["c-peptide"])), 
+       y = expression(ln("Scaled HOMA1-IR"["insulin"]))) + 
+  theme(plot.margin = margin(t = 6))  
+
+grid.arrange(b_cpeptide_insulin,
+             b_cpeptide_fitted,
+             ir_cpeptide_insulin,
+             ir_cpeptide_fitted,
+             ncol = 2)
+
+```
+
+Save plots.
+
+```{r}
+export_dir <- here::here("exports", "HOMA_regression")
+
+if (!dir.exists(export_dir)) {
+  dir.create(export_dir, recursive = T)
+}
+
+# graphing parameters
+dpi <- 600
+width <- 1.5
+height <- 1.5
+units <- "in"
+
+# save plots
+ggsave(file.path(export_dir, "homa_regression_b_cpep_ins.tiff"), b_cpeptide_insulin,
+       width = width, height = height, units = units, dpi = dpi)
+ggsave(file.path(export_dir, "homa_regression_b_cpep_fit.tiff"), b_cpeptide_fitted,
+       width = width, height = height, units = units, dpi = dpi)
+ggsave(file.path(export_dir, "homa_regression_ir_cpep_ins.tiff"), ir_cpeptide_insulin,
+       width = width, height = height, units = units, dpi = dpi)
+ggsave(file.path(export_dir, "homa_regression_ir_cpep_fit.tiff"), ir_cpeptide_fitted,
+       width = width, height = height, units = units, dpi = dpi)
+
+# save absolute difference
+write_csv(abdif_summary, file.path(export_dir, "homa_regression_ab_dif.csv"))
+```
+
+# Test model on hold-out data
+
+```{r}
+test_data <- test_data %>%
+  mutate(homa1b_pred = exp(predict(homa1b_model, newdata = test_data, re.form = NA)),
+         homa1ir_pred = exp(predict(homa1ir_model, newdata = test_data, re.form = NA))) # re.form = NA to specify no random effects
+```
+
+```{r}
+# graphing parameters
+base_size <- 7
+size = 0.1
+
+b_cpeptide_insulin <- ggplot(test_data, mapping = aes(x = log(cpeptide_homa1b), y = log(insulin_homa1b))) + 
+  theme_classic(base_size = base_size) +
+  geom_point(size = size) + 
+  geom_density_2d() + 
+  geom_abline(intercept = 0, slope = 1, color = "red") + 
+  labs(x = expression(ln("HOMA1-B"["c-peptide"])), 
+       y = expression(ln("HOMA1-B"["insulin"]))) + 
+  theme(plot.margin = margin(t = 6))
+
+b_cpeptide_fitted <- ggplot(test_data, mapping = aes(x = log(cpeptide_homa1b), y = log(homa1b_pred))) + 
+  theme_classic(base_size = base_size) +
+  geom_point(size = size) + 
+  geom_density_2d() + 
+  geom_abline(intercept = 0, slope = 1, color = "red") + 
+  labs(x = expression(ln("HOMA1-B"["c-peptide"])), 
+       y = expression(ln("Scaled HOMA1-B"["insulin"]))) + 
+  theme(plot.margin = margin(t = 6))
+
+ir_cpeptide_insulin <- ggplot(test_data, mapping = aes(x = log(cpeptide_homa1ir), y = log(insulin_homa1ir))) + 
+  theme_classic(base_size = base_size) +
+  geom_point(size = size) + 
+  geom_density_2d() +
+  geom_abline(intercept = 0, slope = 1, color = "red") + 
+  labs(x = expression(ln("HOMA1-IR"["c-peptide"])), 
+       y = expression(ln("HOMA1-IR"["insulin"]))) + 
+  theme(plot.margin = margin(t = 6)) 
+
+ir_cpeptide_fitted <- ggplot(test_data, mapping = aes(x = log(cpeptide_homa1ir), y = log(homa1ir_pred))) + 
+  theme_classic(base_size = base_size) +
+  geom_point(size = size) + 
+  geom_density_2d() +
+  geom_abline(intercept = 0, slope = 1, color = "red") + 
+  labs(x = expression(ln("HOMA1-IR"["c-peptide"])), 
+       y = expression(ln("Scaled HOMA1-IR"["insulin"]))) + 
+  theme(plot.margin = margin(t = 6))  
+
+grid.arrange(b_cpeptide_insulin,
+             b_cpeptide_fitted,
+             ir_cpeptide_insulin,
+             ir_cpeptide_fitted,
+             ncol = 2)
+
+```
+
+```{r}
+# calculate absolute difference
+test_data <- test_data %>% 
+  mutate(homa1b_ad = abs(cpeptide_homa1b - insulin_homa1b),
+         homa1ir_ad = abs(cpeptide_homa1ir - insulin_homa1ir),
+         homa1b_fit_ad = abs(cpeptide_homa1b - homa1b_pred),
+         homa1ir_fit_ad = abs(cpeptide_homa1ir - homa1ir_pred))
+
+abdif_list <- list("homa1b_ab_dif" = summary(test_data$homa1b_ad) %>% as.list() %>% as_tibble(),
+                   "homa1ir_ab_dif" = summary(test_data$homa1ir_ad) %>% as.list() %>% as_tibble(),
+                   "homa1b_fitted_ab_dif" = summary(test_data$homa1b_fit_ad) %>% as.list() %>% as_tibble(),
+                   "homa1ir_fitted_ab_dif" = summary(test_data$homa1ir_fit_ad) %>% as.list() %>% as_tibble())
+
+abdif_summary <- bind_rows(abdif_list) %>%
+  mutate(model = names(abdif_list),
+         pairedTTest = c(NA, NA, 
+                         t.test(test_data$homa1b_fit_ad, test_data$homa1b_ad, paired = T)$p.value,
+                         t.test(test_data$homa1ir_fit_ad, test_data$homa1ir_ad, paired = T)$p.value)) %>%
+  relocate(model)
+```
+
+Save graphs and summary differences.
+
+```{r}
+
+# save plots
+ggsave(file.path(export_dir, "homa_regression_b_cpep_ins_test.tiff"), b_cpeptide_insulin,
+       width = width, height = height, units = units, dpi = dpi)
+ggsave(file.path(export_dir, "homa_regression_b_cpep_fit_test.tiff"), b_cpeptide_fitted,
+       width = width, height = height, units = units, dpi = dpi)
+ggsave(file.path(export_dir, "homa_regression_ir_cpep_ins_test.tiff"), ir_cpeptide_insulin,
+       width = width, height = height, units = units, dpi = dpi)
+ggsave(file.path(export_dir, "homa_regression_ir_cpep_fit_test.tiff"), ir_cpeptide_fitted,
+       width = width, height = height, units = units, dpi = dpi)
+
+# save absolute difference
+write_csv(abdif_summary, file.path(export_dir, "homa_regression_ab_dif_test.csv"))
+```
+
+Save testing data for downstream testing.
+
+```{r}
+write_csv(test_data, file.path(export_dir, "homa_regression_test_data.csv"))
+```
+
+Save models.
+
+```{r}
+saveRDS(homa1b_model, file.path(export_dir, "homa1b_model.RDS"))
+saveRDS(homa1ir_model, file.path(export_dir, "homa1ir_model.RDS"))
+```
+
+# Session information
+
+```{r}
+sessionInfo()
+```
+

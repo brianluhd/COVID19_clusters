@@ -1,5 +1,5 @@
 ---
-title: "feature_engineering_Ahlqvist"
+title: "UAB clustering features"
 author: "Brian Lu"
 date: "`r Sys.Date()`"
 output: 
@@ -20,9 +20,16 @@ Although diabetes is broadly classified as type 1 and type 2 diabetes, type 2 di
 **Objective:** Extract and clean the records from the UAB Health Systems required to reproduce the Ahlqvist clusters.
 
 # Environment set up
+
 ```{r}
 library(RSQLite)
 library(tidyverse)
+```
+
+Set root directory
+
+```{r}
+here::i_am("README.md")
 ```
 
 # Feature extraction
@@ -317,8 +324,8 @@ HOMA2 will be estimated separately using the Excel implementation of the [HOMA2 
 
 ```{r}
 # create export directory if doesn't exist
-export_dir <- "/data/user/brianlu/projects/precision_diabetes/COVID19_clusters/exports"
-export_dir <- file.path(export_dir, paste0("features_Ahlqvist_", Sys.Date()))
+export_dir <- here::here("exports/UAB/raw")
+
 if (!dir.exists(export_dir)) {
   dir.create(export_dir, recursive = T)
 }

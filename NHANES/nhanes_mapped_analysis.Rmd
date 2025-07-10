@@ -1,0 +1,408 @@
+---
+title: "analysis_nhanes"
+author: "Brian Lu"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Environment setup
+
+Import libraries
+
+```{r}
+library(tidyverse)
+library(survey)
+library(openxlsx)
+```
+
+Set root directory
+
+```{r}
+here::i_am("README.md")
+```
+
+## Import data
+Cluster data is imported from
+
+```{r}
+
+export_dir <- here::here("exports", "NHANES")
+nhanes_clusters <- read_csv(file.path(export_dir, "nhanes_mapped_clusters.csv"), show_col_types = F)
+nhanes_data <- read_rds(file.path(export_dir, "nhanes_raw_data.rds"))
+
+```
+
+
+# Data cleaning
+
+Join NHANES clustering data with NHANES data.
+
+```{r}
+data <- nhanes_clusters %>% 
+  full_join(nhanes_data, by = join_by(SEQN))
+```
+
+Use WTSAF2YR and WTSAFPRP for weight calculations since fasting blood samples used. Cycle P is 3.2 years, rest is 2 years
+
+```{r}
+
+nhanes_cycles <- unique(data$cycle)
+cycle2yr <- nhanes_cycles[nhanes_cycles != "P"]
+sum_years <- length(cycle2yr)*2 + length(nhanes_cycles[nhanes_cycles == "P"])*3.2 # Cycle P is 3.2 years, rest is 2 years
+
+data <- data %>%
+  mutate(adjusted_mec_weights = case_when(cycle %in% cycle2yr ~ WTSAF2YR * (2/sum_years),
+                                          cycle == "P" ~ WTSAFPRP * (3.2/sum_years)))
+```
+
+Set factor levels for analysis.
+
+```{r}
+
+data <- data %>%
+  mutate(RIDRETH1 = relevel(factor(RIDRETH1), ref = "Non-Hispanic White"),
+         race = relevel(factor(case_when(RIDRETH1 == "Non-Hispanic White" ~ "White", 
+                          RIDRETH1 == "Non-Hispanic Black" ~ "AA",
+                          .default = "Other")), ref = "White"),
+         overall = factor("Overall"),
+         # adjusted_diet_weights = case_when(is.na(adjusted_diet_weights) ~ 0, .default = adjusted_diet_weights),
+         adjusted_mec_weights = case_when(is.na(adjusted_mec_weights) ~ 0, .default = adjusted_mec_weights),
+         sidd = case_when(mapped_cluster == "SIDD" ~ 1, is.na(mapped_cluster) ~ NA, .default = 0),
+         sird = case_when(mapped_cluster == "SIRD" ~ 1, is.na(mapped_cluster) ~ NA, .default = 0),
+         mod = case_when(mapped_cluster == "MOD" ~ 1, is.na(mapped_cluster) ~ NA, .default = 0),
+         mard = case_when(mapped_cluster == "MARD" ~ 1, is.na(mapped_cluster) ~ NA, .default = 0),
+         SIDD = factor(case_when(mapped_cluster == "SIDD" ~ "SIDD", is.na(mapped_cluster) ~ NA, .default = "Others"), levels = c("Others", "SIDD")),
+         severe = case_when(mapped_cluster == "SIDD" | mapped_cluster == "SIRD" ~ 1, 
+                            mapped_cluster == "MOD" | mapped_cluster == "MARD" ~ 0),
+         Severe = case_when(severe == 1 ~ "Severe", severe == 0 ~ "Mild"),
+         pandemic = factor(case_when(cycle == "L" ~ "2021-2023", cycle == "I" | cycle == "P" ~ "2015-2020")),
+         # insulin use
+         diagnosed_diabetes = case_when(DIQ010 == "Yes" ~ 1, .default = 0),
+         diabetes = case_when(DIQ010 == "Yes" ~ 1,
+                              LBXGH >= 6.5 ~ 1,
+                              LBDGLUSI >= 7 ~ 1,
+                              .default = 0),
+         insulin_med = case_when(DIQ050 == "Yes" ~ 1, 
+                                 DIQ050 == "No" ~ 0),
+         insulin_med_cat = case_when(insulin_med == 1 ~ "Yes", 
+                                     insulin_med == 0 ~ "No"),
+         diabetes_pill = case_when(DIQ070 == "Yes" ~ 1,
+                                   DIQ070 == "No" ~ 0),
+         diabetes_pill_cat = case_when(diabetes_pill == 1 ~ "Yes",
+                                       diabetes_pill == 0 ~ "No"),
+         insurance = case_when(HIQ011 == "Yes" ~ 1, 
+                               HIQ011 == "No" ~ 0))
+         
+
+```
+
+Set overall design. N in design doesn't match all available respondents with clusters since some respondents have an adjusted weight of 0.
+
+```{r}
+NHANES_all <- svydesign(data=data, id=~SDMVPSU, strata=~SDMVSTRA, weights=~adjusted_mec_weights, nest=TRUE)
+
+NHANES <- subset(NHANES_all, 
+                  diabetes == 1 &
+                   RIDAGEYR >= 18 & 
+                   (DID040 >= 18 | is.na(DID040)) & 
+                   !is.na(mapped_cluster))
+
+```
+
+# Analysis
+
+Source analysis functions.
+
+```{r}
+# import functions to summarize features into tables
+source("/data/user/brianlu/projects/precision_diabetes/Clustering/functions_analysis.R")
+
+# import functions to analyze survey data
+source(here::here("NHANES", "survey_analysis_functions.R"))
+```
+
+
+```{r}
+
+# subset to participants used and with non-zero weight
+data_in_analysis <- data %>% filter(diabetes == 1 &
+                                      RIDAGEYR >= 18 & 
+                                      (DID040 >= 18 | is.na(DID040)) & 
+                                      !is.na(mapped_cluster)& 
+                                      adjusted_mec_weights > 0)
+
+# construct patient_char tibble
+patient_n = table(data_in_analysis$pandemic)
+patient_char <- tibble(Period = c("Sex, No. (%)", "Race, No. (%)", "Diabetes subtype, No. (%)", "Severe subtype, No. (%)"), 
+                       pre = "",
+                       post = "",
+                       P = as.numeric(NA))
+
+
+#######################
+# construct counts table to join with patient_char
+
+# calculate counts for table
+baseline <- get_feature_summary(df = data_in_analysis, 
+                                features = c("RIAGENDR", "race", "mapped_cluster", "Severe"),
+                                categories = c("pandemic"),
+                                covariates = NA,
+                                distribution_stat = "ci")
+
+# calculate weighted percentages
+cat_summary <- map(c(~RIAGENDR, ~race, ~mapped_cluster, ~Severe), 
+                   get_cat_summary, 
+                   byformula = ~pandemic, 
+                   design = NHANES) %>% 
+  bind_rows()
+
+# calculate p-values
+cat_p <- c(rep(svychisq(~RIAGENDR + pandemic, NHANES, statistic = "adjWald")$p.value, 2), # twice for male/female
+           rep(svychisq(~race + pandemic, NHANES, statistic = "adjWald")$p.value, 3), # 3 for White, AA, and Other
+           rep(svychisq(~mapped_cluster + pandemic, NHANES, statistic = "adjWald")$p.value, 4), # 4 for 4 clusters
+           rep(svychisq(~Severe + pandemic, NHANES, statistic = "adjWald")$p.value, 2)) # 2 for mild/severe
+
+
+counts_table <- baseline %>% 
+  inner_join(cat_summary, by = join_by(Features, Value)) %>%
+  mutate(pre = str_replace(`2015-2020.x`, "\\(\\d+\\)", paste0("(", `2015-2020.y`, ")")),
+         post = str_replace(`2021-2023.x`, "\\(\\d+\\)", paste0("(", `2021-2023.y`, ")"))) %>%
+  # filter(Value %in% c("Male", "AA", "White")) %>%
+  mutate(Period = paste0("  ", Value)) %>% # rename columns to match and indent
+  mutate(P = cat_p) %>% # add svychisq p-values
+  select(Period, pre, post, P) # select joining columns
+
+# constructs continuous table to join with patient_char
+
+cont_variables <- c(#"LBXGH", # a1c %
+                    "BMXBMI", #BMI kg/m2
+                    "RIDAGEYR")#, # age year
+                    # "homa_insulin_ir", 
+                    # "LBDGLUSI", # glucose mM
+                    # "LBDINSI",  #insulin pM
+                    # "LBXTC", # total cholesterol mg/dL
+                    # "LBDHDD") # HDL mg/dL
+
+# calculate p-values from svyttest
+cont_p <- purrr::map(purrr::map2("pandemic", cont_variables, reformulate),
+                         svyttest, design = NHANES) %>%
+  purrr::map_vec(., (function(x) x$p.value))
+
+# build table
+cont_summary <- map(map(cont_variables, reformulate), 
+                   get_cont_summary, 
+                   byformula = ~pandemic, 
+                   design = NHANES) %>% 
+  bind_rows() %>% 
+  mutate(P = cont_p) %>%
+  mutate(Features = case_when(Features == "LBXGH" ~ "HbA1c [%]",
+                              Features == "BMXBMI" ~ "BMI, mean (95% CI), kg/m2",
+                              Features == "RIDAGEYR" ~ "Age, mean (95% CI), y",
+                              Features == "homa_insulin_ir" ~ "HOMA2-IR",
+                              Features == "LBDGLUSI" ~ "Glucose [mmol/L]",
+                              Features == "LBDINSI" ~ "Insulin [pmol/L",
+                              Features == "LBXTC" ~ "Cholesterol [mg/dL]",
+                              Features == "LBDHDD" ~ "HDL [mg/dL]")
+         ) %>%
+  rename(Period = Features,
+         pre = `2015-2020`,
+         post = `2021-2023`)
+
+
+clusters <- c("SIDD", "SIRD", "MOD", "MARD")
+
+table2 <- bind_rows(patient_char, counts_table, cont_summary) %>%
+  mutate(P = sprintf("%.3f", P),
+         P = str_replace(P, "NA", "")) %>%
+  rename("2015-2020\n(n = {patient_n[1]})" := pre,
+         "2021-2023\n(n = {patient_n[2]})" := post) %>%
+  
+   mutate(Period = factor(Period, levels = c("Sex, No. (%)", 
+                                             "  Male", "  Female",
+                                             "Race, No. (%)", "  White", "  AA", "  Other", 
+                                             "Age, mean (95% CI), y", 
+                                             "BMI, mean (95% CI), kg/m2",
+                                             "Diabetes subtype, No. (%)", paste0("  ", clusters),
+                                             "Severe subtype, No. (%)", "  Severe", "  Mild"))) %>%
+  arrange(Period) #rearrange order by factor
+
+```
+
+Add formatting and export as excel file.
+
+```{r}
+# create workbook
+wb <- createWorkbook()
+
+sheet_name <- "NHANES Char Table"
+
+# add table 1
+addWorksheet(wb, sheetName = sheet_name, gridLines = F)
+writeData(wb, sheet = sheet_name, x = table2, borders = "all", 
+          headerStyle = createStyle(textDecoration = "Bold", 
+                                    border = c("top", "bottom", "left", "right"), 
+                                    halign = "left", 
+                                    valign = "center",
+                                    wrapText = TRUE))
+
+# set column width
+setColWidths(wb, sheet_name, cols = 1:ncol(table2), widths = "auto")
+
+# export
+saveWorkbook(wb, file.path(export_dir, "nhanes_char_table.xlsx"), overwrite = TRUE)
+```
+
+## Cluster features
+
+```{r}
+
+# define plot order and colors
+order <- c("SIDD", "SIRD", "MOD", "MARD")
+color <- c("powderblue", "darkseagreen", "lightsalmon", "plum")
+
+# define plotting features to loop
+y_data <- c("LBXGH", 
+            "RIDAGEYR",
+            "BMXBMI", 
+            "homa1_cpeptide_b",
+            "homa1_cpeptide_ir")
+
+y_labels <- list("HbA1c (%)",
+                 "Age (years)",
+                 bquote("BMI " (kg/m^2)),
+                 "HOMA1-B (%)",
+                 "HOMA1-IR")
+
+names(y_labels) <- y_data
+
+# import clustering features
+clustering_features <- read_csv(file.path(export_dir, "nhanes_clustering_features.csv"), show_col_types = F)
+
+# add cluster labels
+clustering_features <- clustering_features %>% 
+  select(-homa1_cpeptide_b, -homa1_cpeptide_ir)%>%
+  inner_join(nhanes_clusters, by = join_by(SEQN)) %>%
+  filter(SEQN %in% data_in_analysis$SEQN)
+
+# graph
+for (y in y_data){
+ feature_plot <- ggplot(clustering_features, mapping = aes(x = mapped_cluster, y = .data[[y]], fill = mapped_cluster)) + 
+                        stat_boxplot(geom = "errorbar", width = 0.25, linewidth = 0.25) +
+                        geom_boxplot(outlier.size = 0.25, show.legend = F, linewidth = 0.25) + 
+                        scale_fill_manual(values = color, limits = order) +
+                        scale_x_discrete(limits = order) + 
+                        theme_classic() + #jcii_theme +
+                        labs(y = y_labels[[y]] , x = "") + 
+                        theme(axis.text.x = element_text(angle = 45, vjust = 0.5)) #+
+                        # scale_y_continuous(breaks = y_breaks[[y]])
+  
+  ggsave(file.path(export_dir, paste0("nhanes_feature_", y, ".tiff")), feature_plot, dpi = 600, width = 3.5, height = 4.5, units = "cm")
+}
+```
+
+## Severe subtype regression
+
+```{r}
+
+covariates <- c("RIAGENDR", "race", #"RIDRETH1", 
+                "RIDAGEYR", "BMXBMI", "diagnosed_diabetes", "pandemic")
+
+severe_logit <- get_survey_or("severe", covariates, NHANES)
+
+write_csv(severe_logit, file.path(export_dir, "nhanes_severe_regression.csv"))
+
+```
+
+## Subtype vs others regression
+
+```{r}
+
+subtypes <- c("sidd", "sird", "mod", "mard")
+
+for (s in subtypes){
+  s_vs_others <- get_survey_or(s, covariates, NHANES)
+  
+  write_csv(s_vs_others, file.path(export_dir, paste("nhanes", s, "vs_rest_regression.csv", sep = "_")))
+}
+
+```
+
+## Insulin prescription
+
+Construct insulin table.
+
+```{r}
+# subset data to participants with valid insulin question answers
+NHANES_insulin <- subset(NHANES, !is.na(insulin_med_cat))
+data_insulin_analysis <- data_in_analysis %>% filter(!is.na(insulin_med_cat))
+
+insulin_char <- tibble(Subtype = c("Taking insulin, No. (%)"), 
+                       Overall = "",
+                       SIDD = "",
+                       SIRD = "",
+                       MOD = "",
+                       MARD = "",
+                       P = as.numeric(NA))
+
+baseline <- get_feature_summary(df = data_insulin_analysis, 
+                                features = "insulin_med_cat",
+                                categories = c("mapped_cluster"),
+                                covariates = NA,
+                                distribution_stat = "ci")
+
+# calculate weighted percentages
+cat_summary <- map(c(~insulin_med_cat), 
+                   get_cat_summary, 
+                   byformula = ~mapped_cluster, 
+                   design = NHANES_insulin) %>% 
+  bind_rows()
+
+overall_summary <- get_cat_summary(~insulin_med_cat, ~overall, NHANES_insulin)
+
+cat_summary <- cat_summary %>%
+  full_join(overall_summary, by = join_by(Features, Value))
+
+# calculate p-values
+cat_p <- rep(svychisq(~mapped_cluster + insulin_med_cat, NHANES_insulin, statistic = "adjWald")$p.value, 2) # 2 for yes and no
+
+
+counts_table <- baseline %>% 
+  inner_join(cat_summary, by = join_by(Features, Value)) %>%
+  mutate(Overall = str_replace(Overall.x, "\\(\\d+\\)", paste0("(", Overall.y, ")")),
+         SIDD = str_replace(SIDD.x, "\\(\\d+\\)", paste0("(", SIDD.y, ")")),
+         SIRD = str_replace(SIRD.x, "\\(\\d+\\)", paste0("(", SIRD.y, ")")),
+         MOD = str_replace(SIDD.x, "\\(\\d+\\)", paste0("(", MOD.y, ")")),
+         MARD = str_replace(SIDD.x, "\\(\\d+\\)", paste0("(", MARD.y, ")"))) %>%
+  # filter(Value %in% c("Male", "AA", "White")) %>%
+  mutate(Subtype = paste0("  ", Value)) %>% # rename columns to match and indent
+  mutate(P = cat_p) %>% # add svychisq p-values
+  select(Subtype, Overall, SIDD, SIRD, MOD, MARD, P) # select joining columns
+
+
+insulin_char_table <- bind_rows(insulin_char, counts_table) %>%
+  mutate(P = sprintf("%.3f", P),
+         P = str_replace(P, "NA", ""))
+
+write_csv(insulin_char_table, file.path(export_dir, "nhanes_insulin_char.csv"))
+```
+
+Also check if insulin use increased after pandemic.
+
+```{r}
+
+insulin_logit <- get_survey_or("insulin_med", c("mapped_cluster", covariates), NHANES_insulin)
+
+write_csv(insulin_logit, file.path(export_dir, "nhanes_insulin_regression.csv"))
+
+```
+
+# Session information
+
+```{r}
+sessionInfo()
+```
+

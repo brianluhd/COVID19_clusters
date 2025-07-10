@@ -1,0 +1,193 @@
+---
+title: "HOMA regression cluster testing"
+author: "Brian Lu"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Overview
+HOMA1 estimates calculated with insulin and c-peptide may results in differences. 
+
+**Objective:** Extract additional clustering features from NHANES and UAB data for the HOMA regression test data to use in cluster assignment.
+
+# Environment setup
+
+```{r}
+library(tidyverse)
+library(nhanesA)
+```
+
+# Data extraction
+
+```{r}
+table_names <- c("L10", "BMX") # for a1c, bmi
+
+table_suffixes <- c("nosuffix", "B", "C") # for 1999-2000, 2001-2002, 2003-2004
+
+nhanes_tables <- list()
+
+for (s in table_suffixes){
+  nhanes_tables[[s]] <- list()
+  
+  table_codes <- purrr::map_vec(table_names, paste, s, sep = "_")
+  table_codes <- map(table_codes, ~str_remove(string = .x, pattern = "_nosuffix$"))
+  
+  nhanes_tables[[s]] <- map(table_codes, nhanes) %>% # table INS_G will give download length error since INS is in GLU that year
+    map(., as_tibble)
+  
+  names(nhanes_tables[[s]]) <- table_names
+}
+
+# 1999-2000 cycle HbA1c is under LAB10 instead of L10
+nhanes_tables[["nosuffix"]][["L10"]] <- nhanes("LAB10") %>% as_tibble()
+```
+
+Merge cycles.
+
+```{r}
+cycle_tables <- list()
+
+for (s in table_suffixes){
+  cycle_tables[[s]] <- nhanes_tables[[s]]$L10 %>% mutate(cycle = s)
+  
+  for (t in table_names[table_names != "L10"]){
+    
+    cycle_tables[[s]] <- cycle_tables[[s]] %>% 
+      full_join(nhanes_tables[[s]][[t]]) #%>% select(-one_of("WTPH2YR")) # remove phebotomy weight, causes duplication issues
+  }
+}
+
+merged_nhanes <- bind_rows(cycle_tables)
+```
+
+# Data cleaning
+
+Import test data from HOMA regression.
+
+```{r}
+export_dir <- here::here("exports", "HOMA_regression")
+
+test_data <- read_csv(file.path(export_dir, "homa_regression_test_data.csv"), show_col_types = F)
+
+nhanes_test_data <- test_data %>% filter(source == "nhanes")
+
+```
+
+Append additional data from NHANES.
+
+```{r}
+nhanes_test_data <- left_join(nhanes_test_data, merged_nhanes, by = c("DE_ID" = "SEQN"))
+```
+
+
+Filter to participants with diabetes.
+
+```{r}
+nhanes_test_data <- nhanes_test_data %>% 
+  filter(source == "nhanes" & (DIQ010 == "Yes" | glucose >= 7 | LBXGH >= 6.5)) %>%
+  # filter to HOMA range
+  filter(glucose > 3.5 & glucose <= 25 &
+           cpeptide >= 0.2 & cpeptide <= 3.5 & 
+           insulin >= 20 & insulin <= 400) %>%
+  select(DE_ID, source, LBXGH, BMXBMI, RIDAGEYR, 
+         cpeptide_homa1b, cpeptide_homa1ir, insulin_homa1b, insulin_homa1ir, 
+         homa1b_pred, homa1ir_pred) %>%
+  drop_na() %>%
+  rename(a1c = LBXGH,
+         bmi = BMXBMI,
+         diabetes_age = RIDAGEYR,
+         homa1_cpeptide_b = cpeptide_homa1b, 
+         homa1_cpeptide_ir = cpeptide_homa1ir, 
+         homa1_insulin_b = insulin_homa1b, 
+         homa1_insulin_ir = insulin_homa1ir,
+         homa1_pred_b = homa1b_pred,
+         homa1_pred_ir = homa1ir_pred) %>%
+  # impute gad as negative
+  mutate(gad = 0)
+```
+
+Import UAB post-pandemic data to extract features needed for cluster assignment.
+
+```{r}
+# import additional clustering features
+uab_post <- read_csv(here::here("exports/UAB/uab_mapped_outpatient.csv"), show_col_types = F) %>%
+  # filter to records with insulin, c-peptide, and glucose tested at the same time
+  filter(homa_cpeptide_date == homa_insulin_date & 
+           homa_cpeptide_glucose == homa_insulin_glucose) %>%
+  select(DE_ID, gad, a1c, bmi, diabetes_age) 
+  
+uab_pre <- read_csv(file.path("/data/user/brianlu/projects/precision_diabetes/Clustering/exports", 
+                              "manuscript_Ahlqvist_analysis_2024-05-03/outpatient.csv"), show_col_types = F) %>%
+  # filter to records with insulin, c-peptide, and glucose tested at the same time
+  filter(homa_cpeptide_date == homa_insulin_date & 
+           homa_cpeptide_glucose == homa_insulin_glucose) %>%
+  select(DE_ID, gad, a1c, bmi, diabetes_age, 
+         # also get raw values and known cluster
+         homa_cpeptide_cpeptide, homa_cpeptide_glucose, homa_insulin_insulin, homa_insulin_glucose, Ahlqvist)
+
+uab_data <- bind_rows(list(uab_pre, uab_post))
+
+uab_test_data <- test_data %>% 
+  filter(source == "uab") %>%
+  # filter to HOMA range
+  filter(glucose > 3.5 & glucose <= 25 &
+           cpeptide >= 0.2 & cpeptide <= 3.5 & 
+           insulin >= 20 & insulin <= 400) %>%
+  inner_join(uab_data, by = join_by(DE_ID)) %>%
+  select(DE_ID, source, gender, race, 
+         gad, a1c, bmi, diabetes_age, 
+         cpeptide_homa1b, cpeptide_homa1ir, insulin_homa1b, insulin_homa1ir, 
+         homa1b_pred, homa1ir_pred,
+         homa_cpeptide_cpeptide, homa_cpeptide_glucose, homa_insulin_insulin, homa_insulin_glucose, Ahlqvist) %>%
+  rename(homa1_cpeptide_b = cpeptide_homa1b, 
+         homa1_cpeptide_ir = cpeptide_homa1ir, 
+         homa1_insulin_b = insulin_homa1b, 
+         homa1_insulin_ir = insulin_homa1ir,
+         homa1_pred_b = homa1b_pred,
+         homa1_pred_ir = homa1ir_pred)
+
+```
+
+
+```{r}
+
+homa1b_model <- readRDS(here::here("exports/HOMA_regression/homa1b_model.RDS"))
+homa1ir_model <- readRDS(here::here("exports/HOMA_regression/homa1ir_model.RDS"))
+
+# calculate HOMA1
+uab_test_data <- uab_test_data %>%
+  mutate(cluster_homa1_cpeptide_b = (20 * 6 * homa_cpeptide_cpeptide) / (homa_cpeptide_glucose - 3.5),
+         cluster_homa1_cpeptide_ir = (homa_cpeptide_glucose * 6 * homa_cpeptide_cpeptide) / 22.5,
+         insulin_homa1b = (20 * homa_insulin_insulin/6) / (homa_insulin_glucose - 3.5),
+         insulin_homa1ir = (homa_insulin_glucose * homa_insulin_insulin/6) / 22.5) 
+
+
+
+uab_test_data <- uab_test_data %>%
+  # re.form = NA to specify no random effects
+  mutate(cluster_homa1b_pred = exp(predict(homa1b_model, newdata = uab_test_data, re.form = NA)), 
+         cluster_homa1ir_pred = exp(predict(homa1ir_model, newdata = uab_test_data, re.form = NA))) %>%
+  # rename clustering insulin HOMA1 to keep separate
+  rename(cluster_homa1_insulin_b = insulin_homa1b,
+         cluster_homa1_insulin_ir = insulin_homa1ir)
+
+```
+
+Merge and export data for cluster assignment.
+
+```{r}
+cleaned_test_data <- bind_rows(list(uab_test_data, nhanes_test_data))
+
+write_csv(cleaned_test_data, here::here("exports", "HOMA_regression/cluster_assignment_test_data.csv"))
+```
+
+# Session information
+
+```{r}
+sessionInfo()
+```
+
