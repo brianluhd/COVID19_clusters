@@ -274,8 +274,8 @@ y_data <- c("LBXGH",
 y_labels <- list("HbA1c (%)",
                  "Age (years)",
                  bquote("BMI " (kg/m^2)),
-                 "HOMA1-B (%)",
-                 "HOMA1-IR")
+                 expression(atop("Scaled", paste("HOMA1"["insulin"], "-B", " (%)"))),
+                 expression(atop("Scaled", paste("HOMA1"["insulin"], "-IR"))))
 
 names(y_labels) <- y_data
 
@@ -296,9 +296,12 @@ for (y in y_data){
                         scale_x_discrete(limits = order) + 
                         theme_classic() + 
                         labs(y = y_labels[[y]] , x = "") + 
-                        theme(axis.text.x = element_text(angle = 45, vjust = 0.5)) 
+                        theme(axis.text.x = element_text(angle = 45, vjust = 0.5),
+                              plot.margin = margin(t = 13)) 
   
-  ggsave(file.path(export_dir, paste0("nhanes_denovo_feature_", y, ".tiff")), feature_plot, dpi = 600, width = 3.5, height = 4.5, units = "cm")
+  ggsave(file.path(export_dir, paste0("nhanes_denovo_feature_", y, ".tiff")), feature_plot, dpi = 600, 
+         width = ifelse(str_detect(y, "homa"), 4.0, 3.5), 
+         height = 4.5, units = "cm")
 }
 ```
 

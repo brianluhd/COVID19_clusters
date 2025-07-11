@@ -274,8 +274,8 @@ y_data <- c("LBXGH",
 y_labels <- list("HbA1c (%)",
                  "Age (years)",
                  bquote("BMI " (kg/m^2)),
-                 "HOMA1-B (%)",
-                 "HOMA1-IR")
+                 expression(atop("Scaled", paste("HOMA1"["insulin"], "-B", " (%)"))),
+                 expression(atop("Scaled", paste("HOMA1"["insulin"], "-IR"))))
 
 names(y_labels) <- y_data
 
@@ -284,6 +284,8 @@ clustering_features <- read_csv(file.path(export_dir, "nhanes_clustering_feature
 
 # add cluster labels
 clustering_features <- clustering_features %>% 
+  mutate(homa1_insulin_b = (20 * LBDINSI/6)/(LBDGLUSI - 3.5),
+         homa1_insulin_ir = ((LBDINSI/6) * LBDGLUSI) / 22.5) %>% 
   select(-homa1_cpeptide_b, -homa1_cpeptide_ir)%>%
   inner_join(nhanes_clusters, by = join_by(SEQN)) %>%
   filter(SEQN %in% data_in_analysis$SEQN)
@@ -297,10 +299,13 @@ for (y in y_data){
                         scale_x_discrete(limits = order) + 
                         theme_classic() + #jcii_theme +
                         labs(y = y_labels[[y]] , x = "") + 
-                        theme(axis.text.x = element_text(angle = 45, vjust = 0.5)) #+
+                        theme(axis.text.x = element_text(angle = 45, vjust = 0.5),
+                              plot.margin = margin(t = 13)) #+
                         # scale_y_continuous(breaks = y_breaks[[y]])
   
-  ggsave(file.path(export_dir, paste0("nhanes_feature_", y, ".tiff")), feature_plot, dpi = 600, width = 3.5, height = 4.5, units = "cm")
+  ggsave(file.path(export_dir, paste0("nhanes_feature_", y, ".tiff")), feature_plot, dpi = 600, 
+         width = ifelse(str_detect(y, "homa"), 4.0, 3.5), 
+         height = 4.5, units = "cm")
 }
 ```
 
