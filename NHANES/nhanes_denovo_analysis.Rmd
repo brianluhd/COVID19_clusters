@@ -297,7 +297,7 @@ for (y in y_data){
                         theme_classic() + 
                         labs(y = y_labels[[y]] , x = "") + 
                         theme(axis.text.x = element_text(angle = 45, vjust = 0.5),
-                              plot.margin = margin(t = 13)) 
+                              plot.margin = margin(t = 13, r = 5)) 
   
   ggsave(file.path(export_dir, paste0("nhanes_denovo_feature_", y, ".tiff")), feature_plot, dpi = 600, 
          width = ifelse(str_detect(y, "homa"), 4.0, 3.5), 
