@@ -1,1 +1,1 @@
-# Analysis of the distribution of type 2 diabetes subtypes in US adults before and after the COVID-19 pandemic using a diabetes subtype classification model
+# Validation of a Diabetes Subtype Classification Model Using Data from U.S. Adults Before and After the COVID-19 Pandemic 
