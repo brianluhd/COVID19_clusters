@@ -1,0 +1,134 @@
+---
+title: "HOMA scaling models"
+author: "Brian Lu"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+    df_print: paged
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Overview
+
+**Objective:** Prepare fixed-effects only models of the trained HOMA scaling models for release.
+
+# Environment set up
+
+```{r}
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+```
+
+Set root directory
+
+```{r}
+here::i_am("README.md")
+
+export_dir <- here::here("exports/HOMA_regression")
+```
+
+
+# Generate public release models
+
+Create custom function to use on lists.
+
+```{r}
+
+predict_release <- function(object, newdata) {
+
+  X <- model.matrix(
+    object$terms,
+    newdata,
+    xlev = object$xlevels,
+    contrasts.arg = object$contrasts
+  )
+
+  drop(X %*% object$beta)
+}
+
+```
+
+
+Strip models down to minimum required fixed effects for public release.
+
+```{r}
+# HOMA1-B model
+homa1b_model <- readRDS(here::here("exports/HOMA_regression/homa1b_model.RDS"))
+
+homa1b_fe_model <- list(
+  beta = fixef(homa1b_model),
+  terms = delete.response(terms(homa1b_model)),
+  xlevels = .getXlevels(terms(homa1b_model), model.frame(homa1b_model)),
+  contrasts = attr(model.matrix(homa1b_model), "contrasts"),
+  predict = predict_release
+)
+
+# HOMA1-IR model
+homa1ir_model <- readRDS(here::here("exports/HOMA_regression/homa1ir_model.RDS"))
+
+homa1ir_fe_model <- list(
+  beta = fixef(homa1ir_model),
+  terms = delete.response(terms(homa1ir_model)),
+  xlevels = .getXlevels(terms(homa1ir_model), model.frame(homa1ir_model)),
+  contrasts = attr(model.matrix(homa1ir_model), "contrasts"),
+  predict = predict_release
+)
+
+```
+
+
+# Test release models
+
+Read in test data.
+
+```{r}
+
+test_data <- read_csv(here::here("exports/HOMA_regression/homa_regression_test_data.csv"), show_col_types = F)
+
+```
+
+The new predicted HOMA1-B values are identical to those predicted by the original model.
+
+```{r}
+test_data <- test_data %>%
+     # re.form = NA to specify no random effects
+     mutate(homa1b_pred = exp(predict(homa1b_model, newdata = test_data, re.form = NA)),
+            homa1b_release_pred = exp(homa1b_fe_model$predict(homa1b_fe_model, newdata = test_data)))
+
+identical(test_data$homa1b_pred, test_data$homa1b_release_pred)
+
+```
+
+The new predicted HOMA1-IR values are identical to those predicted by the original model.
+
+```{r}
+test_data <- test_data %>%
+     # re.form = NA to specify no random effects
+     mutate(homa1ir_pred = exp(predict(homa1ir_model, newdata = test_data, re.form = NA)),
+            homa1ir_release_pred = exp(homa1ir_fe_model$predict(homa1ir_fe_model, newdata = test_data)))
+
+identical(test_data$homa1ir_pred, test_data$homa1ir_release_pred)
+
+```
+
+# Export minimal release models
+
+```{r}
+
+saveRDS(homa1b_fe_model, here::here(export_dir, "homa1b_fe_model.RDS"))
+saveRDS(homa1ir_fe_model, here::here(export_dir, "homa1ir_fe_model.RDS"))
+
+```
+
+# Session information
+
+```{r}
+sessionInfo()
+```
