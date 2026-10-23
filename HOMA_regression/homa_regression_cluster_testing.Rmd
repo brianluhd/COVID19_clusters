@@ -90,10 +90,11 @@ Filter to participants with diabetes.
 nhanes_test_data <- nhanes_test_data %>% 
   filter(source == "nhanes" & (DIQ010 == "Yes" | glucose >= 7 | LBXGH >= 6.5)) %>%
   # filter to HOMA range
-  filter(glucose > 3.5 & glucose <= 25 &
-           cpeptide >= 0.2 & cpeptide <= 3.5 & 
-           insulin >= 20 & insulin <= 400) %>%
+  filter(glucose > 3.5 & glucose <= 25) %>% # &
+           #cpeptide >= 0.2 & cpeptide <= 3.5 & 
+           #insulin >= 20 & insulin <= 400) %>%
   select(DE_ID, source, LBXGH, BMXBMI, RIDAGEYR, 
+         glucose,
          cpeptide_homa1b, cpeptide_homa1ir, insulin_homa1b, insulin_homa1ir, 
          homa1b_pred, homa1ir_pred) %>%
   drop_na() %>%
@@ -139,6 +140,7 @@ uab_test_data <- test_data %>%
            insulin >= 20 & insulin <= 400) %>%
   inner_join(uab_data, by = join_by(DE_ID)) %>%
   select(DE_ID, source, gender, race, 
+         glucose,
          gad, a1c, bmi, diabetes_age, 
          cpeptide_homa1b, cpeptide_homa1ir, insulin_homa1b, insulin_homa1ir, 
          homa1b_pred, homa1ir_pred,
